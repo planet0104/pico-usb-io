@@ -29,14 +29,17 @@ pub struct Timing {
     i2s_pins: [u8; 3],
     i2s_on: bool,
     i2s_phase: u8,
-    i2s_snap_len: usize,
-    i2s_snap_off: usize,
+    i2s_half_seen: bool,
+    i2s_ring_w: usize,
+    i2s_ring_r: usize,
+    i2s_ring_n: usize,
 }
 
 const I2S_HALF: usize = 2048;
 const I2S_FRAMES: usize = I2S_HALF / 2;
+const I2S_RING: usize = 8192;
 static mut I2S_DMA: [u32; I2S_HALF * 2] = [0; I2S_HALF * 2];
-static mut I2S_SNAP: [u32; I2S_FRAMES] = [0; I2S_FRAMES];
+static mut I2S_RING_BUF: [u32; I2S_RING] = [0; I2S_RING];
 
 pub struct Edge {
     pub pin: u8,
@@ -99,8 +102,10 @@ impl Timing {
             i2s_pins: [0; 3],
             i2s_on: false,
             i2s_phase: 0,
-            i2s_snap_len: 0,
-            i2s_snap_off: 0,
+            i2s_half_seen: false,
+            i2s_ring_w: 0,
+            i2s_ring_r: 0,
+            i2s_ring_n: 0,
         }
     }
 
@@ -284,8 +289,10 @@ impl Timing {
         self.i2s_bclk = Some(bclk_pin);
         self.i2s_ws = Some(ws_pin);
         self.i2s_data = Some(data_pin);
-        self.i2s_snap_len = 0;
-        self.i2s_snap_off = 0;
+        self.i2s_half_seen = false;
+        self.i2s_ring_w = 0;
+        self.i2s_ring_r = 0;
+        self.i2s_ring_n = 0;
         self.i2s_phase = 0;
         self.arm_dma(1, false);
         self.arm_dma(0, true);
@@ -319,29 +326,46 @@ impl Timing {
         }
         let ch = self.i2s_phase as usize;
         if embassy_rp::pac::DMA.ch(ch).ctrl_trig().read().busy() {
+            self.i2s_half_seen = true;
+            return;
+        }
+        if !self.i2s_half_seen {
             return;
         }
         let start = ch * I2S_HALF;
         let dma = &raw const I2S_DMA as *const u32;
-        let snap = &raw mut I2S_SNAP as *mut u32;
-        for i in 0..I2S_FRAMES {
-            let left = unsafe { core::ptr::read_volatile(dma.add(start + i * 2)) };
-            let right = unsafe { core::ptr::read_volatile(dma.add(start + i * 2 + 1)) };
-            unsafe { core::ptr::write(snap.add(i), (left & 0xFFFF_0000) | (right >> 16)) };
+        let ring = &raw mut I2S_RING_BUF as *mut u32;
+        if self.i2s_ring_n + I2S_FRAMES <= I2S_RING {
+            let mut w = self.i2s_ring_w;
+            for i in 0..I2S_FRAMES {
+                let left = unsafe { core::ptr::read_volatile(dma.add(start + i * 2)) };
+                let right = unsafe { core::ptr::read_volatile(dma.add(start + i * 2 + 1)) };
+                unsafe { core::ptr::write(ring.add(w), (left & 0xFFFF_0000) | (right >> 16)) };
+                w += 1;
+                if w == I2S_RING {
+                    w = 0;
+                }
+            }
+            self.i2s_ring_w = w;
+            self.i2s_ring_n += I2S_FRAMES;
         }
-        self.i2s_snap_len = I2S_FRAMES;
-        self.i2s_snap_off = 0;
+        self.i2s_half_seen = false;
         self.arm_dma(ch, false);
         self.i2s_phase ^= 1;
     }
 
     pub fn i2s_read(&mut self, out: &mut [u8]) -> usize {
         self.i2s_poll();
+        let ring = &raw const I2S_RING_BUF as *const u32;
         let mut n = 0;
-        while n + 4 <= out.len() && self.i2s_snap_off < self.i2s_snap_len {
-            let word = unsafe { core::ptr::read_volatile((&raw const I2S_SNAP as *const u32).add(self.i2s_snap_off)) }.to_le_bytes();
-            out[n..n + 4].copy_from_slice(&word);
-            self.i2s_snap_off += 1;
+        while n + 4 <= out.len() && self.i2s_ring_n > 0 {
+            let word = unsafe { core::ptr::read_volatile(ring.add(self.i2s_ring_r)) };
+            self.i2s_ring_r += 1;
+            if self.i2s_ring_r == I2S_RING {
+                self.i2s_ring_r = 0;
+            }
+            self.i2s_ring_n -= 1;
+            out[n..n + 4].copy_from_slice(&word.to_le_bytes());
             n += 4;
         }
         n
