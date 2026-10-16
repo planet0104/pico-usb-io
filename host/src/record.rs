@@ -38,9 +38,13 @@ fn main() {
         version.protocol, version.firmware, version.pins
     );
     board.i2s_config(BCLK, WS, DATA, RATE).expect("i2s config");
+    println!("等待麦克风启动");
+    let primed = discard_until_live(&mut board);
+    println!("开始录音");
 
     let need = RATE as usize * SECONDS;
     let mut left = Vec::with_capacity(need);
+    left.extend_from_slice(&primed);
     let started = Instant::now();
     while left.len() < need {
         if started.elapsed() > Duration::from_secs((SECONDS as u64) + 4) {
@@ -66,6 +70,55 @@ fn main() {
     board.i2s_config(BCLK, WS, DATA, 0).expect("i2s stop");
     write_wav("record.wav", &left).expect("write wav");
     println!("写好 record.wav，{} 个采样，{:.2} 秒", left.len(), left.len() as f32 / RATE as f32);
+}
+
+fn discard_until_live(board: &mut Board) -> Vec<i16> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mute_need = RATE as usize / 50;
+    let live_need = RATE as usize / 100;
+    let mut mute = 0usize;
+    let mut kept = Vec::new();
+    let mut saving = false;
+    let mut done = false;
+    while Instant::now() < deadline {
+        let Ok(bytes) = board.i2s_read(256) else {
+            continue;
+        };
+        if bytes.len() < 4 {
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        for chunk in bytes.chunks_exact(4) {
+            let word = u32::from_le_bytes(chunk.try_into().unwrap());
+            let sample = amplify((word >> 16) as i16);
+            if saving {
+                if !done && sample.saturating_abs() < 16 {
+                    saving = false;
+                    mute = 1;
+                    kept.clear();
+                    continue;
+                }
+                kept.push(sample);
+                done = kept.len() >= live_need;
+                continue;
+            }
+            if sample.saturating_abs() < 16 {
+                mute += 1;
+                continue;
+            }
+            if mute < mute_need {
+                mute = 0;
+                continue;
+            }
+            saving = true;
+            kept.push(sample);
+            done = kept.len() >= live_need;
+        }
+        if done {
+            return kept;
+        }
+    }
+    Vec::new()
 }
 
 fn amplify(sample: i16) -> i16 {
