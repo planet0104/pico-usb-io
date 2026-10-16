@@ -29,11 +29,14 @@ pub struct Timing {
     i2s_pins: [u8; 3],
     i2s_on: bool,
     i2s_phase: u8,
-    i2s_dma: [u32; 512],
-    i2s_snap: [u32; 256],
     i2s_snap_len: usize,
     i2s_snap_off: usize,
 }
+
+const I2S_HALF: usize = 2048;
+const I2S_FRAMES: usize = I2S_HALF / 2;
+static mut I2S_DMA: [u32; I2S_HALF * 2] = [0; I2S_HALF * 2];
+static mut I2S_SNAP: [u32; I2S_FRAMES] = [0; I2S_FRAMES];
 
 pub struct Edge {
     pub pin: u8,
@@ -96,8 +99,6 @@ impl Timing {
             i2s_pins: [0; 3],
             i2s_on: false,
             i2s_phase: 0,
-            i2s_dma: [0; 512],
-            i2s_snap: [0; 256],
             i2s_snap_len: 0,
             i2s_snap_off: 0,
         }
@@ -247,16 +248,16 @@ impl Timing {
         let src = pio::pio_asm!(
             ".origin 23",
             ".side_set 2",
-            "set x, 14 side 0b01",
+            "set x, 30 side 0b00",
             "left_data:",
-            "in pins, 1 side 0b00",
-            "jmp x-- left_data side 0b01",
-            "in pins, 1 side 0b10",
-            "set x, 14 side 0b11",
+            "in pins, 1 side 0b01",
+            "jmp x-- left_data side 0b00",
+            "in pins, 1 side 0b11",
+            "set x, 30 side 0b10",
             "right_data:",
-            "in pins, 1 side 0b10",
-            "jmp x-- right_data side 0b11",
-            "in pins, 1 side 0b00",
+            "in pins, 1 side 0b11",
+            "jmp x-- right_data side 0b10",
+            "in pins, 1 side 0b01",
         );
         let prog = self.common.try_load_program(&src.program).map_err(|_| ST_NO_SPACE)?;
         let data_pin = take_pin(&mut self.common, data)?;
@@ -266,7 +267,7 @@ impl Timing {
         let mut cfg = Config::default();
         cfg.use_program(&prog, &[&bclk_pin, &ws_pin]);
         cfg.set_in_pins(&[&data_pin]);
-        cfg.clock_divider = calculate_pio_clock_divider(frame_hz * 64);
+        cfg.clock_divider = calculate_pio_clock_divider(frame_hz * 128);
         cfg.shift_in = ShiftConfig {
             threshold: 32,
             direction: ShiftDirection::Left,
@@ -320,11 +321,15 @@ impl Timing {
         if embassy_rp::pac::DMA.ch(ch).ctrl_trig().read().busy() {
             return;
         }
-        let start = ch * 256;
-        for i in 0..256 {
-            self.i2s_snap[i] = unsafe { core::ptr::read_volatile(self.i2s_dma.as_ptr().add(start + i)) };
+        let start = ch * I2S_HALF;
+        let dma = &raw const I2S_DMA as *const u32;
+        let snap = &raw mut I2S_SNAP as *mut u32;
+        for i in 0..I2S_FRAMES {
+            let left = unsafe { core::ptr::read_volatile(dma.add(start + i * 2)) };
+            let right = unsafe { core::ptr::read_volatile(dma.add(start + i * 2 + 1)) };
+            unsafe { core::ptr::write(snap.add(i), (left & 0xFFFF_0000) | (right >> 16)) };
         }
-        self.i2s_snap_len = 256;
+        self.i2s_snap_len = I2S_FRAMES;
         self.i2s_snap_off = 0;
         self.arm_dma(ch, false);
         self.i2s_phase ^= 1;
@@ -334,7 +339,7 @@ impl Timing {
         self.i2s_poll();
         let mut n = 0;
         while n + 4 <= out.len() && self.i2s_snap_off < self.i2s_snap_len {
-            let word = self.i2s_snap[self.i2s_snap_off].to_le_bytes();
+            let word = unsafe { core::ptr::read_volatile((&raw const I2S_SNAP as *const u32).add(self.i2s_snap_off)) }.to_le_bytes();
             out[n..n + 4].copy_from_slice(&word);
             self.i2s_snap_off += 1;
             n += 4;
@@ -343,11 +348,11 @@ impl Timing {
     }
 
     fn arm_dma(&mut self, ch: usize, trigger: bool) {
-        let ptr = unsafe { self.i2s_dma.as_mut_ptr().add(ch * 256) };
+        let ptr = unsafe { (&raw mut I2S_DMA as *mut u32).add(ch * I2S_HALF) };
         let p = embassy_rp::pac::DMA.ch(ch);
         p.read_addr().write_value(embassy_rp::pac::PIO0.rxf(3).as_ptr() as u32);
         p.write_addr().write_value(ptr as u32);
-        p.trans_count().write(|w| *w = 256);
+        p.trans_count().write(|w| *w = I2S_HALF as u32);
         let mut ctrl = embassy_rp::pac::dma::regs::CtrlTrig(0);
         ctrl.set_en(true);
         ctrl.set_data_size(DataSize::SIZE_WORD);

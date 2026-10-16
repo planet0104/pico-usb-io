@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 
 use host::Board;
 
-const RATE: u32 = 16_000;
+const RATE: u32 = 48_000;
 const SECONDS: usize = 5;
+const GAIN: i32 = 64;
 const BCLK: u8 = 10;
 const WS: u8 = 11;
 const DATA: u8 = 12;
@@ -21,7 +22,7 @@ fn main() {
     println!("  INMP441 WS  -> GP{WS}，必须是 SCK 的下一号脚");
     println!("  INMP441 SD  -> GP{DATA}");
     println!("每个 I2S 帧是一个小端 u32：高 16 位是左声道，低 16 位是右声道");
-    println!("录音 {SECONDS} 秒，采样率 {RATE} Hz，写入 record.wav");
+    println!("录音 {SECONDS} 秒，采样率 {RATE} Hz，左声道放大 {GAIN} 倍，写入 record.wav");
 
     let path = std::env::args().nth(1).unwrap_or_else(|| {
         if cfg!(windows) {
@@ -42,7 +43,7 @@ fn main() {
     let mut left = Vec::with_capacity(need);
     let started = Instant::now();
     while left.len() < need {
-        if started.elapsed() > Duration::from_secs(8) {
+        if started.elapsed() > Duration::from_secs((SECONDS as u64) + 4) {
             break;
         }
         let bytes = board.i2s_read(256).expect("i2s read");
@@ -53,7 +54,7 @@ fn main() {
         let mark = left.len() / RATE as usize;
         for chunk in bytes.chunks_exact(4) {
             let word = u32::from_le_bytes(chunk.try_into().unwrap());
-            left.push((word >> 16) as i16);
+            left.push(amplify((word >> 16) as i16));
             if left.len() == need {
                 break;
             }
@@ -65,6 +66,12 @@ fn main() {
     board.i2s_config(BCLK, WS, DATA, 0).expect("i2s stop");
     write_wav("record.wav", &left).expect("write wav");
     println!("写好 record.wav，{} 个采样，{:.2} 秒", left.len(), left.len() as f32 / RATE as f32);
+}
+
+fn amplify(sample: i16) -> i16 {
+    (sample as i32)
+        .saturating_mul(GAIN)
+        .clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
 fn write_wav(path: &str, samples: &[i16]) -> std::io::Result<()> {
