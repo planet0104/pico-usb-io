@@ -73,6 +73,7 @@ impl Board {
     pub fn open(path: &str) -> Result<Self, Error> {
         let port = serialport::new(path, 115_200)
             .timeout(Duration::from_millis(1500))
+            .dtr_on_open(true)
             .open()?;
         Ok(Self {
             port,
@@ -218,7 +219,16 @@ impl Board {
         std::mem::take(&mut self.pending)
     }
 
-    pub fn release(self) {
+    pub fn release(mut self) {
+        let _ = self.port.set_timeout(Duration::from_millis(30));
+        let mut buf = [0u8; 256];
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(100) {
+            match self.port.read(&mut buf) {
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
         let _ = self.port.clear(serialport::ClearBuffer::All);
     }
 

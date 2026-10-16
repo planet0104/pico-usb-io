@@ -6,14 +6,13 @@ mod pins;
 mod timing;
 
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, Either};
 use embassy_rp::adc::{Adc, Channel};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::Pull;
 use embassy_rp::peripherals::USB;
-use embassy_rp::usb::{Driver, Instance, InterruptHandler as UsbInterrupt};
+use embassy_rp::usb::{Driver, InterruptHandler as UsbInterrupt};
 use embassy_time::Timer;
-use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
+use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::UsbDevice;
 use io_proto::{
@@ -60,60 +59,80 @@ async fn main(spawner: Spawner) {
         CONTROL_BUF.init([0; 64]),
     );
     static USB_STATE: StaticCell<State> = StaticCell::new();
-    let mut class = CdcAcmClass::new(&mut builder, USB_STATE.init(State::new()), 64);
+    let class = CdcAcmClass::new(&mut builder, USB_STATE.init(State::new()), 64);
     let usb = builder.build();
+    let (mut tx, rx) = class.split();
     spawner.spawn(usb_task(usb).unwrap());
+    spawner.spawn(usb_reader(rx).unwrap());
 
     loop {
-        class.wait_connection().await;
-        let mut parser = Parser::new();
+        tx.wait_connection().await;
+        let mut host_ready = false;
         loop {
-            if class.line_coding().data_rate() == 1200 {
+            if tx.line_coding().data_rate() == 1200 {
                 embassy_rp::rom_data::reset_to_usb_boot(0, 0);
             }
+            if tx.dtr() {
+                host_ready = true;
+            } else if host_ready && board.timing.i2s_is_on() {
+                board.stop_i2s();
+            }
             board.timing.i2s_poll();
-            let _ = drain_events(&mut class, &mut board).await;
-            let mut sent_audio = false;
+            if drain_events(&mut tx, &mut board).await.is_err() {
+                clear_cmds();
+                break;
+            }
+            if let Some(cmd) = pop_cmd() {
+                let body = resp_body();
+                let nreq = cmd.body_len;
+                let (status, n) = board.handle(cmd.op, &cmd.body[..nreq], body).await;
+                if write_frame(&mut tx, KIND_RESP, cmd.seq, cmd.op, status, &body[..n])
+                    .await
+                    .is_err()
+                {
+                    clear_cmds();
+                    break;
+                }
+                continue;
+            }
             if board.timing.i2s_is_on() {
                 let body = resp_body();
                 let n = board.timing.i2s_read(body);
                 if n > 0 {
-                    let _ = write_frame(&mut class, KIND_EVENT, 0, OP_I2S_READ, ST_OK, &body[..n]).await;
-                    sent_audio = true;
+                    if write_frame(&mut tx, KIND_EVENT, 0, OP_I2S_READ, ST_OK, &body[..n])
+                        .await
+                        .is_err()
+                    {
+                        clear_cmds();
+                        break;
+                    }
+                    continue;
                 }
             }
-            let mut packet = [0u8; 64];
-            let pause = if sent_audio {
-                embassy_time::Duration::from_micros(200)
-            } else {
-                embassy_time::Duration::from_millis(2)
-            };
-            match select(class.read_packet(&mut packet), Timer::after(pause)).await {
-                Either::First(Ok(n)) => {
-                    let frames = frames_buf();
-                    frames.len = 0;
+            Timer::after(embassy_time::Duration::from_millis(1)).await;
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn usb_reader(mut rx: Receiver<'static, MyUsbDriver>) -> ! {
+    loop {
+        rx.wait_connection().await;
+        let mut parser = Parser::new();
+        let mut packet = [0u8; 64];
+        loop {
+            match rx.read_packet(&mut packet).await {
+                Ok(n) => {
                     parser.push(&packet[..n], |frame| {
-                        if frames.len < frames.buf.len() {
-                            frames.buf[frames.len] = OwnedFrame::from_frame(&frame);
-                            frames.len += 1;
+                        if frame.kind == KIND_REQ {
+                            push_cmd(&frame);
                         }
                     });
-                    for i in 0..frames.len {
-                        let seq = frames.buf[i].seq;
-                        let op = frames.buf[i].op;
-                        let kind = frames.buf[i].kind;
-                        let body_len = frames.buf[i].body_len;
-                        if kind != KIND_REQ {
-                            continue;
-                        }
-                        let body = resp_body();
-                        let req = &frames.buf[i].body[..body_len];
-                        let (status, n) = board.handle(op, req, body).await;
-                        let _ = write_frame(&mut class, KIND_RESP, seq, op, status, &body[..n]).await;
-                    }
                 }
-                Either::First(Err(_)) => break,
-                Either::Second(_) => {}
+                Err(_) => {
+                    clear_cmds();
+                    break;
+                }
             }
         }
     }
@@ -143,13 +162,20 @@ impl OwnedFrame {
     }
 }
 
-struct FrameBuf {
+fn resp_body() -> &'static mut [u8; MAX_BODY] {
+    static mut BODY: [u8; MAX_BODY] = [0; MAX_BODY];
+    unsafe { &mut BODY }
+}
+
+struct CmdQ {
     buf: [OwnedFrame; 4],
+    head: usize,
+    tail: usize,
     len: usize,
 }
 
-fn frames_buf() -> &'static mut FrameBuf {
-    static mut FRAMES: FrameBuf = FrameBuf {
+fn cmd_q() -> *mut CmdQ {
+    static mut Q: CmdQ = CmdQ {
         buf: [OwnedFrame {
             kind: 0,
             seq: 0,
@@ -157,14 +183,45 @@ fn frames_buf() -> &'static mut FrameBuf {
             body: [0; MAX_BODY],
             body_len: 0,
         }; 4],
+        head: 0,
+        tail: 0,
         len: 0,
     };
-    unsafe { &mut FRAMES }
+    core::ptr::addr_of_mut!(Q)
 }
 
-fn resp_body() -> &'static mut [u8; MAX_BODY] {
-    static mut BODY: [u8; MAX_BODY] = [0; MAX_BODY];
-    unsafe { &mut BODY }
+fn push_cmd(frame: &Frame) {
+    cortex_m::interrupt::free(|_| unsafe {
+        let q = &mut *cmd_q();
+        if q.len >= q.buf.len() {
+            return;
+        }
+        q.buf[q.tail] = OwnedFrame::from_frame(frame);
+        q.tail = (q.tail + 1) % q.buf.len();
+        q.len += 1;
+    });
+}
+
+fn pop_cmd() -> Option<OwnedFrame> {
+    cortex_m::interrupt::free(|_| unsafe {
+        let q = &mut *cmd_q();
+        if q.len == 0 {
+            return None;
+        }
+        let item = q.buf[q.head];
+        q.head = (q.head + 1) % q.buf.len();
+        q.len -= 1;
+        Some(item)
+    })
+}
+
+fn clear_cmds() {
+    cortex_m::interrupt::free(|_| unsafe {
+        let q = &mut *cmd_q();
+        q.head = 0;
+        q.tail = 0;
+        q.len = 0;
+    });
 }
 
 type MyUsbDriver = Driver<'static, USB>;
@@ -186,8 +243,8 @@ impl From<EndpointError> for Gone {
     }
 }
 
-async fn write_frame<'a, T: Instance + 'a>(
-    class: &mut CdcAcmClass<'a, Driver<'a, T>>,
+async fn write_frame(
+    class: &mut Sender<'static, MyUsbDriver>,
     kind: u8,
     seq: u16,
     op: u16,
@@ -220,8 +277,8 @@ async fn write_frame<'a, T: Instance + 'a>(
     Ok(())
 }
 
-async fn drain_events<'a, T: Instance + 'a>(
-    class: &mut CdcAcmClass<'a, Driver<'a, T>>,
+async fn drain_events(
+    class: &mut Sender<'static, MyUsbDriver>,
     board: &mut Board,
 ) -> Result<(), Gone> {
     while let Some(edge) = board.timing.poll_capture() {
