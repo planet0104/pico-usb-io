@@ -333,6 +333,10 @@ impl Timing {
         embassy_rp::pac::DMA.ints(0).write_value(0b11);
     }
 
+    pub fn i2s_is_on(&self) -> bool {
+        self.i2s_on
+    }
+
     pub fn i2s_poll(&mut self) {}
 
     pub fn i2s_read(&mut self, out: &mut [u8]) -> usize {

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::time::Duration;
 
@@ -65,6 +66,7 @@ pub struct Board {
     parser: Parser,
     seq: u16,
     pending: Vec<PulseEdge>,
+    audio: VecDeque<Vec<u8>>,
 }
 
 impl Board {
@@ -77,6 +79,7 @@ impl Board {
             parser: Parser::new(),
             seq: 1,
             pending: Vec::new(),
+            audio: VecDeque::new(),
         })
     }
 
@@ -229,6 +232,35 @@ impl Board {
         self.call(OP_I2S_READ, &max.to_le_bytes())
     }
 
+    pub fn read_i2s_push(&mut self) -> Result<Vec<u8>, Error> {
+        if let Some(chunk) = self.audio.pop_front() {
+            return Ok(chunk);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut scratch = [0u8; 512];
+        while std::time::Instant::now() < deadline {
+            match self.port.read(&mut scratch) {
+                Ok(0) => return Err(Error::Timeout(0)),
+                Ok(n) => {
+                    let mut audio = Vec::new();
+                    self.parser.push(&scratch[..n], |frame| {
+                        if frame.kind == KIND_EVENT && frame.op == OP_I2S_READ && !frame.body.is_empty() {
+                            audio.push(frame.body.to_vec());
+                        }
+                    });
+                    if !audio.is_empty() {
+                        let first = audio.remove(0);
+                        self.audio.extend(audio);
+                        return Ok(first);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Err(Error::Timeout(0))
+    }
+
     pub fn bitstream(&mut self, pin: u8, timing: BitTiming, data: &[u8]) -> Result<(), Error> {
         for chunk in data.chunks(200) {
             let mut req = vec![pin, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -271,6 +303,7 @@ impl Board {
                 Ok(n) => {
                     let mut found = None;
                     let mut edges = Vec::new();
+                    let mut audio = Vec::new();
                     self.parser.push(&scratch[..n], |frame| {
                         if frame.kind == KIND_EVENT && frame.op == EVT_PULSE && frame.body.len() >= 6 {
                             edges.push(PulseEdge {
@@ -278,11 +311,14 @@ impl Board {
                                 level: frame.body[1],
                                 width_us: u32::from_le_bytes(frame.body[2..6].try_into().unwrap()),
                             });
+                        } else if frame.kind == KIND_EVENT && frame.op == OP_I2S_READ && !frame.body.is_empty() {
+                            audio.push(frame.body.to_vec());
                         } else if frame.kind == KIND_RESP && frame.seq == seq {
                             found = Some((frame.status, frame.body.to_vec()));
                         }
                     });
                     self.pending.extend(edges);
+                    self.audio.extend(audio);
                     if let Some((status, body)) = found {
                         if status != ST_OK {
                             return Err(Error::Status(status));

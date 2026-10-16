@@ -7,7 +7,7 @@ use host::Board;
 
 const RATE: u32 = 48_000;
 const SECONDS: usize = 5;
-const GAIN: i32 = 64;
+const GAIN: i32 = 16;
 const BCLK: u8 = 10;
 const WS: u8 = 11;
 const DATA: u8 = 12;
@@ -50,7 +50,7 @@ fn main() {
         if started.elapsed() > Duration::from_secs((SECONDS as u64) + 4) {
             break;
         }
-        let bytes = board.i2s_read(1024).expect("i2s read");
+        let bytes = board.read_i2s_push().expect("i2s stream");
         if bytes.len() < 4 {
             thread::sleep(Duration::from_millis(1));
             continue;
@@ -81,7 +81,7 @@ fn discard_until_live(board: &mut Board) -> Vec<i16> {
     let mut saving = false;
     let mut done = false;
     while Instant::now() < deadline {
-        let Ok(bytes) = board.i2s_read(1024) else {
+        let Ok(bytes) = board.read_i2s_push() else {
             continue;
         };
         if bytes.len() < 4 {

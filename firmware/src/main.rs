@@ -73,8 +73,22 @@ async fn main(spawner: Spawner) {
             }
             board.timing.i2s_poll();
             let _ = drain_events(&mut class, &mut board).await;
+            let mut sent_audio = false;
+            if board.timing.i2s_is_on() {
+                let body = resp_body();
+                let n = board.timing.i2s_read(body);
+                if n > 0 {
+                    let _ = write_frame(&mut class, KIND_EVENT, 0, OP_I2S_READ, ST_OK, &body[..n]).await;
+                    sent_audio = true;
+                }
+            }
             let mut packet = [0u8; 64];
-            match select(class.read_packet(&mut packet), Timer::after_millis(2)).await {
+            let pause = if sent_audio {
+                embassy_time::Duration::from_micros(200)
+            } else {
+                embassy_time::Duration::from_millis(2)
+            };
+            match select(class.read_packet(&mut packet), Timer::after(pause)).await {
                 Either::First(Ok(n)) => {
                     let frames = frames_buf();
                     frames.len = 0;
