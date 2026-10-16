@@ -1,0 +1,17 @@
+[package]
+name = "host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+io-proto = { path = "../protocol" }
+serialport = "4"
+thiserror = "2"
+
+[[bin]]
+name = "blink"
+path = "src/main.rs"
+
+[[bin]]
+name = "record"
+path = "src/record.rs"

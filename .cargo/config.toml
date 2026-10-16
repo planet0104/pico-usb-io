@@ -1,0 +1,5 @@
+[target.thumbv6m-none-eabi]
+rustflags = [
+  "-C", "target-cpu=cortex-m0plus",
+  "--cfg", "portable_atomic_unsafe_assume_single_core",
+]

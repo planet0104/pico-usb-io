@@ -1,0 +1,25 @@
+[package]
+name = "firmware"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "firmware"
+path = "src/main.rs"
+
+[dependencies]
+io-proto = { path = "../protocol" }
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-rp = { version = "0.10", features = ["defmt", "time-driver", "critical-section-impl", "rp2040", "unstable-pac"] }
+embassy-usb = { version = "0.6", features = ["defmt"] }
+embassy-time = { version = "0.5", features = ["defmt"] }
+embassy-futures = "0.1"
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+static_cell = "2"
+fixed = "1"
+pio = "0.3"
+defmt = "1"
+defmt-rtt = "1"
+panic-probe = { version = "1", features = ["print-defmt"] }
+

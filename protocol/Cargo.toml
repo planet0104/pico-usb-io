@@ -1,0 +1,8 @@
+[package]
+name = "io-proto"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "io_proto"
+path = "src/lib.rs"
