@@ -76,7 +76,8 @@ async fn main(spawner: Spawner) {
             let mut packet = [0u8; 64];
             match select(class.read_packet(&mut packet), Timer::after_millis(2)).await {
                 Either::First(Ok(n)) => {
-                    let mut frames = heapless_frames();
+                    let frames = frames_buf();
+                    frames.len = 0;
                     parser.push(&packet[..n], |frame| {
                         if frames.len < frames.buf.len() {
                             frames.buf[frames.len] = OwnedFrame::from_frame(&frame);
@@ -84,13 +85,17 @@ async fn main(spawner: Spawner) {
                         }
                     });
                     for i in 0..frames.len {
-                        let req = &frames.buf[i];
-                        if req.kind != KIND_REQ {
+                        let seq = frames.buf[i].seq;
+                        let op = frames.buf[i].op;
+                        let kind = frames.buf[i].kind;
+                        let body_len = frames.buf[i].body_len;
+                        if kind != KIND_REQ {
                             continue;
                         }
-                        let mut body = [0u8; MAX_BODY];
-                        let (status, n) = board.handle(req.op, &req.body[..req.body_len], &mut body).await;
-                        let _ = write_frame(&mut class, KIND_RESP, req.seq, req.op, status, &body[..n]).await;
+                        let body = resp_body();
+                        let req = &frames.buf[i].body[..body_len];
+                        let (status, n) = board.handle(op, req, body).await;
+                        let _ = write_frame(&mut class, KIND_RESP, seq, op, status, &body[..n]).await;
                     }
                 }
                 Either::First(Err(_)) => break,
@@ -100,6 +105,7 @@ async fn main(spawner: Spawner) {
     }
 }
 
+#[derive(Clone, Copy)]
 struct OwnedFrame {
     kind: u8,
     seq: u16,
@@ -128,17 +134,23 @@ struct FrameBuf {
     len: usize,
 }
 
-fn heapless_frames() -> FrameBuf {
-    FrameBuf {
-        buf: core::array::from_fn(|_| OwnedFrame {
+fn frames_buf() -> &'static mut FrameBuf {
+    static mut FRAMES: FrameBuf = FrameBuf {
+        buf: [OwnedFrame {
             kind: 0,
             seq: 0,
             op: 0,
             body: [0; MAX_BODY],
             body_len: 0,
-        }),
+        }; 4],
         len: 0,
-    }
+    };
+    unsafe { &mut FRAMES }
+}
+
+fn resp_body() -> &'static mut [u8; MAX_BODY] {
+    static mut BODY: [u8; MAX_BODY] = [0; MAX_BODY];
+    unsafe { &mut BODY }
 }
 
 type MyUsbDriver = Driver<'static, USB>;
@@ -168,7 +180,8 @@ async fn write_frame<'a, T: Instance + 'a>(
     status: u8,
     body: &[u8],
 ) -> Result<(), Gone> {
-    let mut raw = [0u8; MAX_FRAME];
+    static mut RAW: [u8; MAX_FRAME] = [0; MAX_FRAME];
+    let raw = unsafe { &mut RAW };
     let Some(n) = io_proto::encode(
         Frame {
             kind,
@@ -177,7 +190,7 @@ async fn write_frame<'a, T: Instance + 'a>(
             status,
             body,
         },
-        &mut raw,
+        raw,
     ) else {
         return Ok(());
     };

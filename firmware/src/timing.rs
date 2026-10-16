@@ -35,7 +35,7 @@ pub struct Timing {
 
 const I2S_HALF: usize = 2048;
 const I2S_FRAMES: usize = I2S_HALF / 2;
-const I2S_RING: usize = 8192;
+const I2S_RING: usize = 16384;
 static mut I2S_DMA: [u32; I2S_HALF * 2] = [0; I2S_HALF * 2];
 static mut I2S_RING_BUF: [u32; I2S_RING] = [0; I2S_RING];
 static mut I2S_RING_W: usize = 0;
@@ -421,14 +421,15 @@ fn on_i2s_dma() {
 fn copy_half(ch: usize) {
     compiler_fence(Ordering::Acquire);
     cortex_m::interrupt::free(|_| unsafe {
-        if !I2S_LIVE || I2S_RING_N + I2S_FRAMES > I2S_RING {
+        if !I2S_LIVE || I2S_RING_N >= I2S_RING {
             return;
         }
         let dma = &raw const I2S_DMA as *const u32;
         let ring = &raw mut I2S_RING_BUF as *mut u32;
         let start = ch * I2S_HALF;
         let mut w = I2S_RING_W;
-        for i in 0..I2S_FRAMES {
+        let count = I2S_FRAMES.min(I2S_RING - I2S_RING_N);
+        for i in 0..count {
             let left = core::ptr::read_volatile(dma.add(start + i * 2));
             let right = core::ptr::read_volatile(dma.add(start + i * 2 + 1));
             core::ptr::write(ring.add(w), (left & 0xFFFF_0000) | (right >> 16));
@@ -438,7 +439,7 @@ fn copy_half(ch: usize) {
             }
         }
         I2S_RING_W = w;
-        I2S_RING_N += I2S_FRAMES;
+        I2S_RING_N += count;
     });
 }
 

@@ -4,7 +4,7 @@ pub const SOF0: u8 = 0xA5;
 pub const SOF1: u8 = 0x5A;
 pub const PROTO_VERSION: u16 = 1;
 pub const PIN_COUNT: u8 = 30;
-pub const MAX_BODY: usize = 256;
+pub const MAX_BODY: usize = 1024;
 pub const HEADER_LEN: usize = 8;
 pub const MAX_FRAME: usize = 2 + HEADER_LEN + MAX_BODY + 2;
 

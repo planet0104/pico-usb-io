@@ -50,7 +50,7 @@ fn main() {
         if started.elapsed() > Duration::from_secs((SECONDS as u64) + 4) {
             break;
         }
-        let bytes = board.i2s_read(256).expect("i2s read");
+        let bytes = board.i2s_read(1024).expect("i2s read");
         if bytes.len() < 4 {
             thread::sleep(Duration::from_millis(1));
             continue;
@@ -81,7 +81,7 @@ fn discard_until_live(board: &mut Board) -> Vec<i16> {
     let mut saving = false;
     let mut done = false;
     while Instant::now() < deadline {
-        let Ok(bytes) = board.i2s_read(256) else {
+        let Ok(bytes) = board.i2s_read(1024) else {
             continue;
         };
         if bytes.len() < 4 {
