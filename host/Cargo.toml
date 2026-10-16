@@ -15,3 +15,7 @@ path = "src/main.rs"
 [[bin]]
 name = "record"
 path = "src/record.rs"
+
+[[bin]]
+name = "ws2812"
+path = "src/ws2812.rs"
