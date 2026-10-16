@@ -129,7 +129,7 @@ fn amplify(sample: i16) -> i16 {
 }
 
 fn write_wav(path: &str, samples: &[i16]) -> std::io::Result<()> {
-    let mut file = File::create(path)?;
+    let mut file = std::io::BufWriter::new(File::create(path)?);
     let data_len = (samples.len() * 2) as u32;
     let mut hdr = Vec::with_capacity(44);
     hdr.extend_from_slice(b"RIFF");
@@ -148,5 +148,6 @@ fn write_wav(path: &str, samples: &[i16]) -> std::io::Result<()> {
     for sample in samples {
         file.write_all(&sample.to_le_bytes())?;
     }
+    file.flush()?;
     Ok(())
 }
