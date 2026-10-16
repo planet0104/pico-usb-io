@@ -297,18 +297,26 @@ impl Board {
             &mut raw,
         )
         .expect("frame fits");
-        self.port.write_all(&raw[..n])?;
-        self.port.flush()?;
+        self.port.set_timeout(Duration::from_millis(50))?;
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        let mut scratch = [0u8; 256];
+        let mut off = 0;
+        let mut scratch = [0u8; 1024];
         while std::time::Instant::now() < deadline {
+            if off < n {
+                match self.port.write(&raw[off..n]) {
+                    Ok(0) => {}
+                    Ok(k) => off += k,
+                    Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(err) => return Err(err.into()),
+                }
+            }
             match self.port.read(&mut scratch) {
                 Ok(0) => return Err(Error::Timeout(seq)),
-                Ok(n) => {
+                Ok(got) => {
                     let mut found = None;
                     let mut edges = Vec::new();
                     let mut audio = Vec::new();
-                    self.parser.push(&scratch[..n], |frame| {
+                    self.parser.push(&scratch[..got], |frame| {
                         if frame.kind == KIND_EVENT && frame.op == EVT_PULSE && frame.body.len() >= 6 {
                             edges.push(PulseEdge {
                                 pin: frame.body[0],
