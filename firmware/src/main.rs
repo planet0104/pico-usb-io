@@ -30,6 +30,7 @@ use {defmt_rtt as _, panic_probe as _};
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterrupt<USB>;
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO0>;
+    DMA_IRQ_0 => timing::I2sDmaHandler;
 });
 
 #[embassy_executor::main]

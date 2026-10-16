@@ -1,4 +1,7 @@
+use core::sync::atomic::{compiler_fence, Ordering};
+
 use embassy_rp::gpio::Level;
+use embassy_rp::interrupt::InterruptExt;
 use embassy_rp::pac::dma::vals::{DataSize, TreqSel};
 use embassy_rp::peripherals::{self, PIO0};
 use embassy_rp::pio::{
@@ -28,11 +31,6 @@ pub struct Timing {
     i2s_data: Option<Pin<'static, PIO0>>,
     i2s_pins: [u8; 3],
     i2s_on: bool,
-    i2s_phase: u8,
-    i2s_half_seen: bool,
-    i2s_ring_w: usize,
-    i2s_ring_r: usize,
-    i2s_ring_n: usize,
 }
 
 const I2S_HALF: usize = 2048;
@@ -40,6 +38,11 @@ const I2S_FRAMES: usize = I2S_HALF / 2;
 const I2S_RING: usize = 8192;
 static mut I2S_DMA: [u32; I2S_HALF * 2] = [0; I2S_HALF * 2];
 static mut I2S_RING_BUF: [u32; I2S_RING] = [0; I2S_RING];
+static mut I2S_RING_W: usize = 0;
+static mut I2S_RING_R: usize = 0;
+static mut I2S_RING_N: usize = 0;
+static mut I2S_LIVE: bool = false;
+static mut I2S_NEXT: u8 = 0;
 
 pub struct Edge {
     pub pin: u8,
@@ -101,11 +104,6 @@ impl Timing {
             i2s_data: None,
             i2s_pins: [0; 3],
             i2s_on: false,
-            i2s_phase: 0,
-            i2s_half_seen: false,
-            i2s_ring_w: 0,
-            i2s_ring_r: 0,
-            i2s_ring_n: 0,
         }
     }
 
@@ -289,13 +287,23 @@ impl Timing {
         self.i2s_bclk = Some(bclk_pin);
         self.i2s_ws = Some(ws_pin);
         self.i2s_data = Some(data_pin);
-        self.i2s_half_seen = false;
-        self.i2s_ring_w = 0;
-        self.i2s_ring_r = 0;
-        self.i2s_ring_n = 0;
-        self.i2s_phase = 0;
-        self.arm_dma(1, false);
-        self.arm_dma(0, true);
+        cortex_m::interrupt::free(|_| unsafe {
+            I2S_LIVE = false;
+            I2S_RING_W = 0;
+            I2S_RING_R = 0;
+            I2S_RING_N = 0;
+            I2S_NEXT = 0;
+        });
+        embassy_rp::pac::DMA.ints(0).write_value(0b11);
+        arm_dma_ch(1, false);
+        arm_dma_ch(0, true);
+        unsafe { I2S_LIVE = true };
+        let inte = embassy_rp::pac::DMA.inte(0).read() | 0b11;
+        embassy_rp::pac::DMA.inte(0).write_value(inte);
+        unsafe {
+            embassy_rp::interrupt::DMA_IRQ_0.unpend();
+            embassy_rp::interrupt::DMA_IRQ_0.enable();
+        }
         self.i2s_on = true;
         Ok(())
     }
@@ -305,6 +313,10 @@ impl Timing {
             return;
         }
         self.i2s_on = false;
+        unsafe { I2S_LIVE = false };
+        let inte = embassy_rp::pac::DMA.inte(0).read() & !0b11;
+        embassy_rp::pac::DMA.inte(0).write_value(inte);
+        embassy_rp::interrupt::DMA_IRQ_0.disable();
         embassy_rp::pac::DMA.chan_abort().write(|w| w.set_chan_abort(0b11));
         while embassy_rp::pac::DMA.ch(0).ctrl_trig().read().busy() {}
         while embassy_rp::pac::DMA.ch(1).ctrl_trig().read().busy() {}
@@ -318,77 +330,27 @@ impl Timing {
         for pin in self.i2s_pins {
             crate::pins::set_hiz(pin);
         }
+        embassy_rp::pac::DMA.ints(0).write_value(0b11);
     }
 
-    pub fn i2s_poll(&mut self) {
-        if !self.i2s_on {
-            return;
-        }
-        let ch = self.i2s_phase as usize;
-        if embassy_rp::pac::DMA.ch(ch).ctrl_trig().read().busy() {
-            self.i2s_half_seen = true;
-            return;
-        }
-        if !self.i2s_half_seen {
-            return;
-        }
-        let start = ch * I2S_HALF;
-        let dma = &raw const I2S_DMA as *const u32;
-        let ring = &raw mut I2S_RING_BUF as *mut u32;
-        if self.i2s_ring_n + I2S_FRAMES <= I2S_RING {
-            let mut w = self.i2s_ring_w;
-            for i in 0..I2S_FRAMES {
-                let left = unsafe { core::ptr::read_volatile(dma.add(start + i * 2)) };
-                let right = unsafe { core::ptr::read_volatile(dma.add(start + i * 2 + 1)) };
-                unsafe { core::ptr::write(ring.add(w), (left & 0xFFFF_0000) | (right >> 16)) };
-                w += 1;
-                if w == I2S_RING {
-                    w = 0;
-                }
-            }
-            self.i2s_ring_w = w;
-            self.i2s_ring_n += I2S_FRAMES;
-        }
-        self.i2s_half_seen = false;
-        self.arm_dma(ch, false);
-        self.i2s_phase ^= 1;
-    }
+    pub fn i2s_poll(&mut self) {}
 
     pub fn i2s_read(&mut self, out: &mut [u8]) -> usize {
-        self.i2s_poll();
-        let ring = &raw const I2S_RING_BUF as *const u32;
-        let mut n = 0;
-        while n + 4 <= out.len() && self.i2s_ring_n > 0 {
-            let word = unsafe { core::ptr::read_volatile(ring.add(self.i2s_ring_r)) };
-            self.i2s_ring_r += 1;
-            if self.i2s_ring_r == I2S_RING {
-                self.i2s_ring_r = 0;
+        cortex_m::interrupt::free(|_| unsafe {
+            let ring = &raw const I2S_RING_BUF as *const u32;
+            let mut n = 0;
+            while n + 4 <= out.len() && I2S_RING_N > 0 {
+                let word = core::ptr::read_volatile(ring.add(I2S_RING_R));
+                I2S_RING_R += 1;
+                if I2S_RING_R == I2S_RING {
+                    I2S_RING_R = 0;
+                }
+                I2S_RING_N -= 1;
+                out[n..n + 4].copy_from_slice(&word.to_le_bytes());
+                n += 4;
             }
-            self.i2s_ring_n -= 1;
-            out[n..n + 4].copy_from_slice(&word.to_le_bytes());
-            n += 4;
-        }
-        n
-    }
-
-    fn arm_dma(&mut self, ch: usize, trigger: bool) {
-        let ptr = unsafe { (&raw mut I2S_DMA as *mut u32).add(ch * I2S_HALF) };
-        let p = embassy_rp::pac::DMA.ch(ch);
-        p.read_addr().write_value(embassy_rp::pac::PIO0.rxf(3).as_ptr() as u32);
-        p.write_addr().write_value(ptr as u32);
-        p.trans_count().write(|w| *w = I2S_HALF as u32);
-        let mut ctrl = embassy_rp::pac::dma::regs::CtrlTrig(0);
-        ctrl.set_en(true);
-        ctrl.set_data_size(DataSize::SIZE_WORD);
-        ctrl.set_incr_write(true);
-        ctrl.set_chain_to(if ch == 0 { 1 } else { 0 });
-        ctrl.set_treq_sel(TreqSel::PIO0_RX3);
-        ctrl.set_irq_quiet(true);
-        if trigger {
-            p.ctrl_trig().write_value(ctrl);
-        } else {
-            p.al1_ctrl().write_value(ctrl.0);
-        }
+            n
+        })
     }
 
     fn load_bits(&mut self, t1: u8, t2: u8, t3: u8) -> Result<(), u8> {
@@ -422,6 +384,82 @@ impl Timing {
             self.capture_stop();
         }
     }
+}
+
+pub struct I2sDmaHandler;
+
+impl embassy_rp::interrupt::typelevel::Handler<embassy_rp::interrupt::typelevel::DMA_IRQ_0> for I2sDmaHandler {
+    unsafe fn on_interrupt() {
+        on_i2s_dma();
+    }
+}
+
+fn on_i2s_dma() {
+    let dma = embassy_rp::pac::DMA;
+    for _ in 0..2 {
+        let status = dma.ints(0).read() & 0b11;
+        if status == 0 {
+            return;
+        }
+        if unsafe { !I2S_LIVE } {
+            dma.ints(0).write_value(status);
+            return;
+        }
+        let next = unsafe { I2S_NEXT };
+        let ch = if status & (1 << next) != 0 {
+            next
+        } else {
+            status.trailing_zeros() as u8
+        };
+        dma.ints(0).write_value(1 << ch);
+        copy_half(ch as usize);
+        arm_dma_ch(ch as usize, false);
+        unsafe { I2S_NEXT = ch ^ 1 };
+    }
+}
+
+fn copy_half(ch: usize) {
+    compiler_fence(Ordering::Acquire);
+    cortex_m::interrupt::free(|_| unsafe {
+        if !I2S_LIVE || I2S_RING_N + I2S_FRAMES > I2S_RING {
+            return;
+        }
+        let dma = &raw const I2S_DMA as *const u32;
+        let ring = &raw mut I2S_RING_BUF as *mut u32;
+        let start = ch * I2S_HALF;
+        let mut w = I2S_RING_W;
+        for i in 0..I2S_FRAMES {
+            let left = core::ptr::read_volatile(dma.add(start + i * 2));
+            let right = core::ptr::read_volatile(dma.add(start + i * 2 + 1));
+            core::ptr::write(ring.add(w), (left & 0xFFFF_0000) | (right >> 16));
+            w += 1;
+            if w == I2S_RING {
+                w = 0;
+            }
+        }
+        I2S_RING_W = w;
+        I2S_RING_N += I2S_FRAMES;
+    });
+}
+
+fn arm_dma_ch(ch: usize, trigger: bool) {
+        let ptr = unsafe { (&raw mut I2S_DMA as *mut u32).add(ch * I2S_HALF) };
+        let p = embassy_rp::pac::DMA.ch(ch);
+        p.read_addr().write_value(embassy_rp::pac::PIO0.rxf(3).as_ptr() as u32);
+        p.write_addr().write_value(ptr as u32);
+        p.trans_count().write(|w| *w = I2S_HALF as u32);
+        let mut ctrl = embassy_rp::pac::dma::regs::CtrlTrig(0);
+        ctrl.set_en(true);
+        ctrl.set_data_size(DataSize::SIZE_WORD);
+        ctrl.set_incr_write(true);
+        ctrl.set_chain_to(if ch == 0 { 1 } else { 0 });
+        ctrl.set_treq_sel(TreqSel::PIO0_RX3);
+        ctrl.set_irq_quiet(false);
+        if trigger {
+            p.ctrl_trig().write_value(ctrl);
+        } else {
+            p.al1_ctrl().write_value(ctrl.0);
+        }
 }
 
 fn patch_delay(instr: &mut u16, cycles: u8) {
