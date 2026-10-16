@@ -27,13 +27,13 @@ fn main() {
 
     let timing = BitTiming::ws2812();
     let colors: &[(&str, [u8; 3])] = &[
-        ("red", [0x00, 0x20, 0x00]),
-        ("green", [0x20, 0x00, 0x00]),
+        ("red", [0x20, 0x00, 0x00]),
+        ("green", [0x00, 0x20, 0x00]),
         ("blue", [0x00, 0x00, 0x20]),
         ("off", [0x00, 0x00, 0x00]),
     ];
-    for (name, grb) in colors {
-        board.bitstream(pin, timing, grb).expect("ws2812");
+    for (name, rgb) in colors {
+        board.bitstream(pin, timing, rgb).expect("ws2812");
         println!("GP{pin} {name}");
         thread::sleep(Duration::from_millis(400));
     }
