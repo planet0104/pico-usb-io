@@ -218,6 +218,10 @@ impl Board {
         std::mem::take(&mut self.pending)
     }
 
+    pub fn release(self) {
+        let _ = self.port.clear(serialport::ClearBuffer::All);
+    }
+
     pub fn i2s_config(&mut self, bclk: u8, ws: u8, data: u8, frame_hz: u32) -> Result<(), Error> {
         let mut req = [0u8; 7];
         req[0] = bclk;

@@ -70,6 +70,7 @@ fn main() {
     board.i2s_config(BCLK, WS, DATA, 0).expect("i2s stop");
     write_wav("record.wav", &left).expect("write wav");
     println!("写好 record.wav，{} 个采样，{:.2} 秒", left.len(), left.len() as f32 / RATE as f32);
+    board.release();
 }
 
 fn discard_until_live(board: &mut Board) -> Vec<i16> {
