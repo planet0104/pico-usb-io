@@ -36,3 +36,7 @@ path = "src/battery.rs"
 [[bin]]
 name = "touch"
 path = "src/touch.rs"
+
+[[bin]]
+name = "oled"
+path = "src/oled.rs"
