@@ -92,14 +92,21 @@ impl Board {
             let mut buf = [0u8; 1024];
             while !stop.load(Ordering::Relaxed) {
                 match reader_port.read(&mut buf) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        eprintln!("[board] 后台读线程读到 0 字节，退出");
+                        break;
+                    }
                     Ok(n) => {
                         if tx.send(buf[..n].to_vec()).is_err() {
+                            eprintln!("[board] 后台读线程发送失败（接收端已关闭），退出");
                             break;
                         }
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
-                    Err(_) => break,
+                    Err(err) => {
+                        eprintln!("[board] 后台读线程读取出错，退出: {err}");
+                        break;
+                    }
                 }
             }
         });
@@ -304,6 +311,7 @@ impl Board {
                 return Ok(first);
             }
         }
+        eprintln!("[board] read_i2s_push 2s 内未收到任何音频事件帧");
         Err(Error::Timeout(0))
     }
 
@@ -378,6 +386,7 @@ impl Board {
                 return Ok(body);
             }
         }
+        eprintln!("[board] call 请求 op={op} seq={seq} 3s 内未收到应答");
         Err(Error::Timeout(seq))
     }
 }

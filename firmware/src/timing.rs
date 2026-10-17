@@ -267,6 +267,9 @@ impl Timing {
         let bclk_pin = take_pin(&mut self.common, bclk)?;
         let ws_pin = take_pin(&mut self.common, ws)?;
         self.sm_i2s.set_enable(false);
+        // 复位状态机残留状态（PC/移位计数/时钟分频相位），避免上一次停止后残留导致静音。
+        self.sm_i2s.restart();
+        self.sm_i2s.clkdiv_restart();
         let mut cfg = Config::default();
         cfg.use_program(&prog, &[&bclk_pin, &ws_pin]);
         cfg.set_in_pins(&[&data_pin]);
@@ -314,22 +317,37 @@ impl Timing {
         }
         self.i2s_on = false;
         unsafe { I2S_LIVE = false };
+        // 必须先关 PIO 状态机：否则它会持续产生 RX DREQ，DMA 一直等不到数据，
+        // 完成标志/abort 后 busy 位可能清不掉，导致下面的等待永远不返回。
+        self.sm_i2s.set_enable(false);
         let inte = embassy_rp::pac::DMA.inte(0).read() & !0b11;
         embassy_rp::pac::DMA.inte(0).write_value(inte);
         embassy_rp::interrupt::DMA_IRQ_0.disable();
         embassy_rp::pac::DMA.chan_abort().write(|w| w.set_chan_abort(0b11));
-        while embassy_rp::pac::DMA.ch(0).ctrl_trig().read().busy() {}
-        while embassy_rp::pac::DMA.ch(1).ctrl_trig().read().busy() {}
-        self.sm_i2s.set_enable(false);
+        // 有界等待：busy 位异常时不再死等，否则会冻死整个执行器（连 USB 一起失联）。
+        let mut spins = 0u32;
+        while embassy_rp::pac::DMA.ch(0).ctrl_trig().read().busy()
+            || embassy_rp::pac::DMA.ch(1).ctrl_trig().read().busy()
+        {
+            spins += 1;
+            if spins >= 200_000 {
+                defmt::warn!("i2s_stop: DMA abort 超时，busy 位仍置位");
+                break;
+            }
+            cortex_m::asm::nop();
+        }
         if let Some(prog) = self.i2s_prog.take() {
             unsafe { self.common.free_instr(prog.used_memory) };
         }
         self.i2s_bclk = None;
         self.i2s_ws = None;
         self.i2s_data = None;
-        for pin in self.i2s_pins {
-            crate::pins::set_hiz(pin);
-        }
+        // INMP441 在 SCK/WS 悬空时会进入异常状态，必须断电才能恢复
+        // （表现为之后每次录音都是静音、重新插拔 USB 才正常）。
+        // 因此停止后把时钟线拉到确定的低电平，而不是 HiZ。
+        crate::pins::set_output(self.i2s_pins[0], false);
+        crate::pins::set_output(self.i2s_pins[1], false);
+        crate::pins::set_input(self.i2s_pins[2], false, false);
         embassy_rp::pac::DMA.ints(0).write_value(0b11);
     }
 
