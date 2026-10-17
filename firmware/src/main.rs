@@ -3,7 +3,7 @@
 
 mod buses;
 mod pins;
-mod timing;
+mod pio;
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{select, Either};
@@ -12,33 +12,34 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::Pull;
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterrupt};
-use embassy_time::Timer;
+use embassy_time::{Duration, Timer};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::UsbDevice;
 use io_proto::{
     read_u16, read_u32, Frame, Parser, KIND_EVENT, KIND_REQ, KIND_RESP, MAX_BODY, MAX_FRAME,
-    OP_ADC_READ, OP_BITSTREAM, OP_GPIO_READ, OP_GPIO_WRITE, OP_I2C_CONFIG, OP_I2C_TRANSFER,
-    OP_PIN_CONFIG, OP_PULSE_CAPTURE_START, OP_PULSE_CAPTURE_STOP, OP_PULSE_PLAY, OP_PWM_SET,
-    OP_I2S_CONFIG, OP_I2S_READ, OP_SPI_CONFIG, OP_SPI_TRANSFER, OP_UART_CONFIG, OP_UART_READ,
-    OP_UART_WRITE, OP_VERSION, PIN_COUNT, PIN_HIZ, PIN_INPUT, PIN_OUTPUT, PROTO_VERSION, PULL_DOWN,
-    PULL_UP, SPI_MISO_NONE, ST_BAD_ARG, ST_BAD_PIN, ST_IO, ST_OK, EVT_PULSE,
+    OP_ADC_READ, OP_GPIO_READ, OP_GPIO_WRITE, OP_I2C_CONFIG, OP_I2C_TRANSFER, OP_PIN_CONFIG,
+    OP_PIO_LOAD, OP_PIO_RX_POP, OP_PIO_SM_CONFIG, OP_PIO_SM_ENABLE, OP_PIO_SM_RESTART,
+    OP_PIO_STREAM_EVENT, OP_PIO_STREAM_START, OP_PIO_STREAM_STATUS, OP_PIO_STREAM_STOP,
+    OP_PIO_TX_PUSH, OP_PIO_UNLOAD, OP_PWM_SET, OP_SPI_CONFIG, OP_SPI_TRANSFER, OP_UART_CONFIG,
+    OP_UART_READ, OP_UART_WRITE, OP_VERSION, PIN_COUNT, PIN_HIZ, PIN_INPUT, PIN_OUTPUT,
+    PROTO_VERSION, PULL_DOWN, PULL_UP, SPI_MISO_NONE, ST_BAD_ARG, ST_BAD_PIN, ST_IO, ST_OK,
 };
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
+const FIRMWARE_VERSION: u16 = 2;
+
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterrupt<USB>;
-    PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO0>;
-    DMA_IRQ_0 => timing::I2sDmaHandler;
+    DMA_IRQ_0 => pio::StreamDmaHandler;
 });
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     let adc = Adc::new_blocking(p.ADC, Default::default());
-    let timing = timing::Timing::new(p.PIO0, Irqs);
-    let mut board = Board::new(adc, timing);
+    let mut board = Board::new(adc);
 
     let driver = Driver::new(p.USB, Irqs);
     let mut config = embassy_usb::Config::new(0x2E8A, 0x000A);
@@ -73,24 +74,18 @@ async fn main(spawner: Spawner) {
             if tx.line_coding().data_rate() == 1200 {
                 embassy_rp::rom_data::reset_to_usb_boot(0, 0);
             }
-            if tx.dtr() {
-                host_ready = true;
-            } else {
-                if host_ready && board.timing.i2s_is_on() {
-                    board.stop_i2s();
+            if !tx.dtr() {
+                if host_ready {
+                    board.pio.reset();
+                    host_ready = false;
                 }
-                Timer::after(embassy_time::Duration::from_millis(1)).await;
+                Timer::after(Duration::from_millis(1)).await;
                 continue;
             }
-            board.timing.i2s_poll();
-            if drain_events(&mut tx, &mut board).await.is_err() {
-                clear_cmds();
-                break;
-            }
+            host_ready = true;
             if let Some(cmd) = pop_cmd() {
                 let body = resp_body();
-                let nreq = cmd.body_len;
-                let (status, n) = board.handle(cmd.op, &cmd.body[..nreq], body).await;
+                let (status, n) = board.handle(cmd.op, &cmd.body[..cmd.body_len], body).await;
                 if write_frame(&mut tx, KIND_RESP, cmd.seq, cmd.op, status, &body[..n])
                     .await
                     .is_err()
@@ -100,21 +95,19 @@ async fn main(spawner: Spawner) {
                 }
                 continue;
             }
-            if board.timing.i2s_is_on() {
-                let body = resp_body();
-                let n = board.timing.i2s_read(body);
-                if n > 0 {
-                    if write_frame(&mut tx, KIND_EVENT, 0, OP_I2S_READ, ST_OK, &body[..n])
-                        .await
-                        .is_err()
-                    {
-                        clear_cmds();
-                        break;
-                    }
-                    continue;
+            let body = resp_body();
+            let n = board.pio.stream_read(body);
+            if n > 0 {
+                if write_frame(&mut tx, KIND_EVENT, 0, OP_PIO_STREAM_EVENT, ST_OK, &body[..n])
+                    .await
+                    .is_err()
+                {
+                    clear_cmds();
+                    break;
                 }
+                continue;
             }
-            Timer::after(embassy_time::Duration::from_millis(1)).await;
+            Timer::after(Duration::from_millis(1)).await;
         }
     }
 }
@@ -145,7 +138,6 @@ async fn usb_reader(mut rx: Receiver<'static, MyUsbDriver>) -> ! {
 
 #[derive(Clone, Copy)]
 struct OwnedFrame {
-    kind: u8,
     seq: u16,
     op: u16,
     body: [u8; MAX_BODY],
@@ -153,12 +145,18 @@ struct OwnedFrame {
 }
 
 impl OwnedFrame {
+    const EMPTY: Self = Self {
+        seq: 0,
+        op: 0,
+        body: [0; MAX_BODY],
+        body_len: 0,
+    };
+
     fn from_frame(frame: &Frame<'_>) -> Self {
         let mut body = [0u8; MAX_BODY];
         let n = frame.body.len().min(MAX_BODY);
         body[..n].copy_from_slice(&frame.body[..n]);
         Self {
-            kind: frame.kind,
             seq: frame.seq,
             op: frame.op,
             body,
@@ -169,7 +167,7 @@ impl OwnedFrame {
 
 fn resp_body() -> &'static mut [u8; MAX_BODY] {
     static mut BODY: [u8; MAX_BODY] = [0; MAX_BODY];
-    unsafe { &mut BODY }
+    unsafe { &mut *core::ptr::addr_of_mut!(BODY) }
 }
 
 struct CmdQ {
@@ -181,13 +179,7 @@ struct CmdQ {
 
 fn cmd_q() -> *mut CmdQ {
     static mut Q: CmdQ = CmdQ {
-        buf: [OwnedFrame {
-            kind: 0,
-            seq: 0,
-            op: 0,
-            body: [0; MAX_BODY],
-            body_len: 0,
-        }; 4],
+        buf: [OwnedFrame::EMPTY; 4],
         head: 0,
         tail: 0,
         len: 0,
@@ -257,7 +249,7 @@ async fn write_frame(
     body: &[u8],
 ) -> Result<(), Gone> {
     static mut RAW: [u8; MAX_FRAME] = [0; MAX_FRAME];
-    let raw = unsafe { &mut RAW };
+    let raw = unsafe { &mut *core::ptr::addr_of_mut!(RAW) };
     let Some(n) = io_proto::encode(
         Frame {
             kind,
@@ -288,12 +280,7 @@ async fn write_packet(class: &mut Sender<'static, MyUsbDriver>, data: &[u8]) -> 
             abort_in_transfers();
             return Err(Gone);
         }
-        match select(
-            class.write_packet(data),
-            Timer::after(embassy_time::Duration::from_millis(20)),
-        )
-        .await
-        {
+        match select(class.write_packet(data), Timer::after(Duration::from_millis(20))).await {
             Either::First(result) => return result.map_err(Into::into),
             Either::Second(_) => {}
         }
@@ -315,20 +302,6 @@ fn abort_in_transfers() {
     }
 }
 
-async fn drain_events(
-    class: &mut Sender<'static, MyUsbDriver>,
-    board: &mut Board,
-) -> Result<(), Gone> {
-    while let Some(edge) = board.timing.poll_capture() {
-        let mut body = [0u8; 6];
-        body[0] = edge.pin;
-        body[1] = edge.level;
-        body[2..6].copy_from_slice(&edge.width_us.to_le_bytes());
-        write_frame(class, KIND_EVENT, 0, EVT_PULSE, ST_OK, &body).await?;
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
     Free,
@@ -337,13 +310,12 @@ enum Role {
     I2c(u8),
     Spi(u8),
     Uart(u8),
-    Capture,
-    I2s,
+    Pio,
 }
 
 struct Board {
     adc: Adc<'static, embassy_rp::adc::Blocking>,
-    timing: timing::Timing,
+    pio: pio::Engine,
     role: [Role; 30],
     i2c0: Option<buses::I2c0>,
     i2c1: Option<buses::I2c1>,
@@ -357,10 +329,10 @@ struct Board {
 }
 
 impl Board {
-    fn new(adc: Adc<'static, embassy_rp::adc::Blocking>, timing: timing::Timing) -> Self {
+    fn new(adc: Adc<'static, embassy_rp::adc::Blocking>) -> Self {
         Self {
             adc,
-            timing,
+            pio: pio::Engine::new(),
             role: [Role::Free; 30],
             i2c0: None,
             i2c1: None,
@@ -379,8 +351,7 @@ impl Board {
             Role::I2c(bus) => self.drop_i2c(bus),
             Role::Spi(bus) => self.drop_spi(bus),
             Role::Uart(bus) => self.drop_uart(bus),
-            Role::Capture => self.timing.capture_stop(),
-            Role::I2s => self.stop_i2s(),
+            Role::Pio => self.pio.release_pin(pin),
             _ => {}
         }
         if (pin as usize) < self.role.len() {
@@ -452,7 +423,7 @@ impl Board {
         match op {
             OP_VERSION => {
                 out[0..2].copy_from_slice(&PROTO_VERSION.to_le_bytes());
-                out[2..4].copy_from_slice(&1u16.to_le_bytes());
+                out[2..4].copy_from_slice(&FIRMWARE_VERSION.to_le_bytes());
                 out[4] = PIN_COUNT;
                 Ok(5)
             }
@@ -468,14 +439,34 @@ impl Board {
             OP_UART_CONFIG => self.uart_config(req),
             OP_UART_WRITE => self.uart_write(req),
             OP_UART_READ => self.uart_read(req, out),
-            OP_PULSE_PLAY => self.pulse_play(req).await,
-            OP_PULSE_CAPTURE_START => self.capture_start(req),
-            OP_PULSE_CAPTURE_STOP => self.capture_stop(req),
-            OP_BITSTREAM => self.bitstream(req).await,
-            OP_I2S_CONFIG => self.i2s_config(req),
-            OP_I2S_READ => self.i2s_read(req, out),
+            OP_PIO_LOAD => self.pio.load(req, out),
+            OP_PIO_UNLOAD => self.pio.unload(req),
+            OP_PIO_SM_CONFIG => self.pio_sm_config(req),
+            OP_PIO_SM_ENABLE => self.pio.sm_enable(req),
+            OP_PIO_SM_RESTART => self.pio.sm_restart(req),
+            OP_PIO_TX_PUSH => self.pio.tx_push(req, out).await,
+            OP_PIO_RX_POP => self.pio.rx_pop(req, out),
+            OP_PIO_STREAM_START => self.pio.stream_start(req),
+            OP_PIO_STREAM_STOP => self.pio.stream_stop(req),
+            OP_PIO_STREAM_STATUS => self.pio.stream_status(out),
             _ => Err(ST_BAD_ARG),
         }
+    }
+
+    fn pio_sm_config(&mut self, req: &[u8]) -> Result<usize, u8> {
+        let mask = pio::config_pins(req)?;
+        for pin in 0..PIN_COUNT {
+            if mask & (1 << pin) != 0 {
+                self.prepare(pin)?;
+            }
+        }
+        self.pio.sm_config(req, mask)?;
+        for pin in 0..PIN_COUNT {
+            if mask & (1 << pin) != 0 {
+                self.role[pin as usize] = Role::Pio;
+            }
+        }
+        Ok(0)
     }
 
     fn pin_config(&mut self, req: &[u8]) -> Result<usize, u8> {
@@ -712,93 +703,6 @@ impl Board {
             n += 1;
         }
         Ok(n)
-    }
-
-    async fn pulse_play(&mut self, req: &[u8]) -> Result<usize, u8> {
-        let pin = *req.first().ok_or(ST_BAD_ARG)?;
-        let count = read_u16(req, 1).ok_or(ST_BAD_ARG)? as usize;
-        if count == 0 || req.len() < 3 + count * 5 {
-            return Err(ST_BAD_ARG);
-        }
-        let mut pulses = [(0u8, 0u32); 48];
-        if count > pulses.len() {
-            return Err(ST_BAD_ARG);
-        }
-        for i in 0..count {
-            let at = 3 + i * 5;
-            pulses[i] = (req[at], read_u32(req, at + 1).ok_or(ST_BAD_ARG)?);
-        }
-        self.prepare(pin)?;
-        self.timing.pulse_play(pin, &pulses[..count]).await?;
-        self.role[pin as usize] = Role::Gpio;
-        Ok(0)
-    }
-
-    fn capture_start(&mut self, req: &[u8]) -> Result<usize, u8> {
-        let pin = *req.first().ok_or(ST_BAD_ARG)?;
-        self.prepare(pin)?;
-        self.timing.capture_start(pin)?;
-        self.role[pin as usize] = Role::Capture;
-        Ok(0)
-    }
-
-    fn capture_stop(&mut self, req: &[u8]) -> Result<usize, u8> {
-        let pin = *req.first().ok_or(ST_BAD_ARG)?;
-        if self.role.get(pin as usize) == Some(&Role::Capture) {
-            self.timing.capture_stop();
-            self.role[pin as usize] = Role::Free;
-        }
-        Ok(0)
-    }
-
-    fn stop_i2s(&mut self) {
-        self.timing.i2s_stop();
-        for role in &mut self.role {
-            if *role == Role::I2s {
-                *role = Role::Free;
-            }
-        }
-    }
-
-    fn i2s_config(&mut self, req: &[u8]) -> Result<usize, u8> {
-        let bclk = *req.first().ok_or(ST_BAD_ARG)?;
-        let ws = *req.get(1).ok_or(ST_BAD_ARG)?;
-        let data = *req.get(2).ok_or(ST_BAD_ARG)?;
-        let hz = read_u32(req, 3).ok_or(ST_BAD_ARG)?;
-        if hz == 0 {
-            self.stop_i2s();
-            return Ok(0);
-        }
-        self.stop_i2s();
-        self.prepare(bclk)?;
-        self.prepare(ws)?;
-        self.prepare(data)?;
-        self.timing.i2s_start(bclk, ws, data, hz)?;
-        self.role[bclk as usize] = Role::I2s;
-        self.role[ws as usize] = Role::I2s;
-        self.role[data as usize] = Role::I2s;
-        Ok(0)
-    }
-
-    fn i2s_read(&mut self, req: &[u8], out: &mut [u8]) -> Result<usize, u8> {
-        let max = read_u16(req, 0).ok_or(ST_BAD_ARG)? as usize;
-        let n = max.min(out.len());
-        Ok(self.timing.i2s_read(&mut out[..n]))
-    }
-
-    async fn bitstream(&mut self, req: &[u8]) -> Result<usize, u8> {
-        self.stop_i2s();
-        let pin = *req.first().ok_or(ST_BAD_ARG)?;
-        let t0h = read_u16(req, 1).ok_or(ST_BAD_ARG)?;
-        let t0l = read_u16(req, 3).ok_or(ST_BAD_ARG)?;
-        let t1h = read_u16(req, 5).ok_or(ST_BAD_ARG)?;
-        let t1l = read_u16(req, 7).ok_or(ST_BAD_ARG)?;
-        let reset = read_u16(req, 9).ok_or(ST_BAD_ARG)?;
-        let data = req.get(11..).ok_or(ST_BAD_ARG)?;
-        self.prepare(pin)?;
-        self.timing.bitstream(pin, t0h, t0l, t1h, t1l, reset, data).await?;
-        self.role[pin as usize] = Role::Gpio;
-        Ok(0)
     }
 }
 

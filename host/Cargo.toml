@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 io-proto = { path = "../protocol" }
+pio = "0.3"
 serialport = "4"
 thiserror = "2"
 

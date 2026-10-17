@@ -1,9 +1,10 @@
 use std::fs::File;
 use std::io::Write;
-use std::thread;
 use std::time::{Duration, Instant};
 
-use host::Board;
+use host::{
+    Board, Program, SmConfig, PIO_JOIN_RX, PIO_RESTART_CLKDIV, PIO_RESTART_FIFOS, PIO_RESTART_SM,
+};
 
 const RATE: u32 = 48_000;
 const SECONDS: usize = 15;
@@ -13,6 +14,40 @@ const HP_ALPHA: f32 = 0.995;
 const BCLK: u8 = 10;
 const WS: u8 = 11;
 const DATA: u8 = 12;
+const PIO: u8 = 0;
+const SM: u8 = 0;
+
+/// 每声道只采前 16 个 SCK 的数据，后 16 个只出时钟；每帧 128 个 PIO 周期，
+/// autopush 32 位，所以每帧一个 u32：高 16 位左声道，低 16 位右声道。
+/// side-set bit0 = SCK，bit1 = WS。
+fn i2s_program() -> Program {
+    pio::pio_asm!(
+        ".side_set 2",
+        ".wrap_target",
+        "    set x, 15          side 0b00",
+        "left_in:",
+        "    in pins, 1         side 0b01",
+        "    jmp x-- left_in    side 0b00",
+        "    set x, 13          side 0b01",
+        "left_skip:",
+        "    nop                side 0b00",
+        "    jmp x-- left_skip  side 0b01",
+        "    nop                side 0b00",
+        "    nop                side 0b11",
+        "    set x, 15          side 0b10",
+        "right_in:",
+        "    in pins, 1         side 0b11",
+        "    jmp x-- right_in   side 0b10",
+        "    set x, 13          side 0b11",
+        "right_skip:",
+        "    nop                side 0b10",
+        "    jmp x-- right_skip side 0b11",
+        "    nop                side 0b10",
+        "    nop                side 0b01",
+        ".wrap",
+    )
+    .program
+}
 
 /// 带时间戳的阶段日志，用于定位卡点。
 fn step(t0: Instant, msg: impl AsRef<str>) {
@@ -29,8 +64,8 @@ fn main() {
     println!("  INMP441 SCK -> GP{BCLK}");
     println!("  INMP441 WS  -> GP{WS}，必须是 SCK 的下一号脚");
     println!("  INMP441 SD  -> GP{DATA}");
-    println!("每个 I2S 帧是一个小端 u32：高 16 位是左声道，低 16 位是右声道");
     println!("录音 {SECONDS} 秒，采样率 {RATE} Hz，左声道高通滤波（约 40Hz）后放大 {GAIN} 倍，写入 record.wav");
+    assert_eq!(WS, BCLK + 1, "side-set 引脚必须相邻：WS 必须是 SCK 的下一号脚");
 
     let path = std::env::args().nth(1).unwrap_or_else(|| {
         if cfg!(windows) {
@@ -40,98 +75,66 @@ fn main() {
         }
     });
 
-    step(t0, format!("[1/8] 打开串口 {path} ..."));
-    let mark = Instant::now();
     let mut board = match Board::open(&path) {
         Ok(board) => board,
         Err(err) => {
-            step(t0, format!("[1/8] 打开串口失败 ({:?}): {err}", mark.elapsed()));
+            step(t0, format!("[1/7] 打开串口 {path} 失败: {err}"));
             std::process::exit(1);
         }
     };
-    step(t0, format!("[1/8] 串口已打开 (+{} ms)", mark.elapsed().as_millis()));
+    step(t0, format!("[1/7] 串口 {path} 已打开"));
 
-    step(t0, "[2/8] 查询固件版本 ...");
-    let mark = Instant::now();
     let version = match board.version() {
         Ok(version) => version,
         Err(err) => {
-            step(t0, format!("[2/8] 查询版本失败/超时 ({:?}): {err}", mark.elapsed()));
+            step(t0, format!("[2/7] 查询版本失败: {err}"));
             std::process::exit(1);
         }
     };
-    println!(
-        "protocol {} firmware {} pins {}",
-        version.protocol, version.firmware, version.pins
-    );
-    step(t0, format!("[2/8] 版本已获取 (+{} ms)", mark.elapsed().as_millis()));
-
-    step(t0, "[3/8] 下发 I2S 启动配置 ...");
-    let mark = Instant::now();
-    if let Err(err) = board.i2s_config(BCLK, WS, DATA, RATE) {
-        step(t0, format!("[3/8] I2S 启动失败/超时 ({:?}): {err}", mark.elapsed()));
-        std::process::exit(1);
-    }
-    step(t0, format!("[3/8] I2S 已启动 (+{} ms)", mark.elapsed().as_millis()));
-
-    println!("等待麦克风启动");
-    let mark = Instant::now();
-    let primed = discard_until_live(&mut board, t0);
     step(
         t0,
         format!(
-            "[4/8] 麦克风预热结束，预录 {} 采样 (+{} ms)",
-            primed.len(),
-            mark.elapsed().as_millis()
+            "[2/7] protocol {} firmware {} pins {}",
+            version.protocol, version.firmware, version.pins
         ),
     );
+
+    let prog = match start_i2s(&mut board) {
+        Ok(prog) => prog,
+        Err(err) => {
+            step(t0, format!("[3/7] I2S 启动失败: {err}"));
+            std::process::exit(1);
+        }
+    };
+    step(t0, format!("[3/7] I2S 已启动，程序装在 PIO{PIO} 地址 {}", prog.origin));
+
+    println!("等待麦克风启动");
+    let primed = discard_until_live(&mut board, t0);
+    step(t0, format!("[4/7] 麦克风预热结束，预录 {} 采样", primed.len()));
 
     println!("开始录音");
     let need = RATE as usize * SECONDS;
     let mut hp = HighPass::new();
     let mut left = Vec::with_capacity(need);
-    // 预录段(raw)也走高通+增益，避免开机瞬态的直流台阶进入文件。
     left.extend(primed.iter().map(|raw| gain(hp.process(*raw as f32))));
     let started = Instant::now();
-    let mut timed_out = false;
     let mut read_errors = 0usize;
-    let mut raw_peak = 0f32;
     let mut clipped = 0usize;
-    while left.len() < need {
-        if started.elapsed() > Duration::from_secs(SECONDS as u64 + 4) {
-            timed_out = true;
-            break;
-        }
-        let mark = Instant::now();
-        let bytes = match board.read_i2s_push() {
-            Ok(bytes) => bytes,
+    while left.len() < need && started.elapsed() < Duration::from_secs(SECONDS as u64 + 4) {
+        let words = match board.read_stream(Duration::from_secs(2)) {
+            Ok(words) => words,
             Err(err) => {
                 read_errors += 1;
-                step(
-                    t0,
-                    format!(
-                        "[5/8] 读取音频帧失败 (#{read_errors}, 阻塞 {:?}): {err}，已采集 {} 采样",
-                        mark.elapsed(),
-                        left.len()
-                    ),
-                );
-                // 连续失败说明固件/串口已经不再流数据，直接退出循环写文件。
+                step(t0, format!("[5/7] 读取音频失败 (#{read_errors}): {err}，已采集 {} 采样", left.len()));
                 if read_errors >= 3 {
                     break;
                 }
                 continue;
             }
         };
-        if bytes.len() < 4 {
-            thread::sleep(Duration::from_millis(1));
-            continue;
-        }
         let before = left.len() / RATE as usize;
-        for chunk in bytes.chunks_exact(4) {
-            let word = u32::from_le_bytes(chunk.try_into().unwrap());
-            let raw = (word >> 16) as i16 as f32;
-            raw_peak = raw_peak.max(raw.abs());
-            let out = gain(hp.process(raw));
+        for word in words {
+            let out = gain(hp.process((word >> 16) as i16 as f32));
             if out.saturating_abs() >= 32760 {
                 clipped += 1;
             }
@@ -144,50 +147,63 @@ fn main() {
             println!("已采集 {} / {need}", left.len());
         }
     }
-    step(
-        t0,
-        format!(
-            "[5/8] 录音循环结束：{} 采样，用时 {:.2}s{}",
-            left.len(),
-            started.elapsed().as_secs_f64(),
-            if timed_out { "（达到超时上限退出）" } else { "" }
-        ),
-    );
     let peak = left.iter().map(|s| (*s as i32).abs()).max().unwrap_or(0);
-    let nonzero = left.iter().filter(|s| **s != 0).count();
-    let mean = if left.is_empty() {
-        0
-    } else {
-        left.iter().map(|s| *s as i64).sum::<i64>() / left.len() as i64
-    };
     step(
         t0,
         format!(
-            "[5/8] 音频统计：峰值 {peak}，均值 {mean}，非零采样 {nonzero}/{}，削顶 {clipped} 个，原始峰值 {raw_peak:.0}，前 8 个样本 {:?}",
+            "[5/7] 录音结束：{} 采样，用时 {:.2}s，峰值 {peak}，削顶 {clipped} 个",
             left.len(),
-            &left[..left.len().min(8)]
+            started.elapsed().as_secs_f64()
         ),
     );
-
-    step(t0, "[6/8] 停止 I2S（下发 hz=0）...");
-    let mark = Instant::now();
-    if let Err(err) = board.i2s_config(BCLK, WS, DATA, 0) {
-        step(t0, format!("[6/8] 停止 I2S 失败/超时 ({:?}): {err}", mark.elapsed()));
-    } else {
-        step(t0, format!("[6/8] I2S 已停止 (+{} ms)", mark.elapsed().as_millis()));
+    if let Ok(status) = board.pio_stream_status() {
+        step(t0, format!("[5/7] 板上缓冲丢弃 {} 个字", status.dropped_words));
     }
 
-    step(t0, "[7/8] 写入 record.wav ...");
-    let mark = Instant::now();
-    write_wav("record.wav", &left).expect("write wav");
-    step(t0, format!("[7/8] 写文件完成 (+{} ms)", mark.elapsed().as_millis()));
-    println!("写好 record.wav，{} 个采样，{:.2} 秒", left.len(), left.len() as f32 / RATE as f32);
+    match stop_i2s(&mut board, prog) {
+        Ok(()) => step(t0, "[6/7] I2S 已停止"),
+        Err(err) => step(t0, format!("[6/7] 停止 I2S 失败: {err}")),
+    }
 
-    step(t0, "[8/8] 释放串口 / 关闭后台读线程 ...");
-    let mark = Instant::now();
+    write_wav("record.wav", &left).expect("write wav");
+    step(
+        t0,
+        format!(
+            "[7/7] 写好 record.wav，{} 个采样，{:.2} 秒",
+            left.len(),
+            left.len() as f32 / RATE as f32
+        ),
+    );
     board.release();
-    step(t0, format!("[8/8] 释放完成 (+{} ms)", mark.elapsed().as_millis()));
-    step(t0, "全部完成，正常退出");
+}
+
+fn start_i2s(board: &mut Board) -> Result<host::PioProgram, host::Error> {
+    let prog = board.pio_load(PIO, &i2s_program())?;
+    let cfg = SmConfig {
+        clkdiv: host::clkdiv(RATE * 128),
+        in_pins: (DATA, 1),
+        sideset_base: BCLK,
+        autopush: true,
+        push_thresh: 32,
+        fifo_join: PIO_JOIN_RX,
+        out_pindirs: (1 << BCLK) | (1 << WS),
+        ..Default::default()
+    };
+    board.pio_sm_config(SM, &prog, &cfg)?;
+    board.pio_sm_restart(PIO, SM, PIO_RESTART_CLKDIV | PIO_RESTART_FIFOS | PIO_RESTART_SM)?;
+    board.pio_stream_start(PIO, SM, false, 255)?;
+    board.pio_sm_enable(PIO, SM, true)?;
+    Ok(prog)
+}
+
+/// INMP441 在 SCK/WS 悬空时会进入异常状态，必须断电才能恢复，所以停止后把时钟线拉低。
+fn stop_i2s(board: &mut Board, prog: host::PioProgram) -> Result<(), host::Error> {
+    board.pio_stream_stop(PIO, SM)?;
+    board.pio_sm_enable(PIO, SM, false)?;
+    board.pin_output(BCLK, false)?;
+    board.pin_output(WS, false)?;
+    board.pin_input(DATA)?;
+    board.pio_unload(prog)
 }
 
 fn discard_until_live(board: &mut Board, t0: Instant) -> Vec<i16> {
@@ -198,29 +214,15 @@ fn discard_until_live(board: &mut Board, t0: Instant) -> Vec<i16> {
     let mut kept = Vec::new();
     let mut saving = false;
     let mut done = false;
-    let mut empty_reads = 0usize;
     while Instant::now() < deadline {
-        let Ok(bytes) = board.read_i2s_push() else {
-            empty_reads += 1;
+        let Ok(words) = board.read_stream(Duration::from_millis(500)) else {
             continue;
         };
-        if bytes.len() < 4 {
-            thread::sleep(Duration::from_millis(1));
-            continue;
-        }
-        if !saving && empty_reads > 0 {
-            step(
-                t0,
-                format!("[4/8] 预热期间有 {empty_reads} 次读取超时（固件可能未在推送音频）"),
-            );
-            empty_reads = 0;
-        }
-        for chunk in bytes.chunks_exact(4) {
-            let word = u32::from_le_bytes(chunk.try_into().unwrap());
+        for word in words {
             let raw = (word >> 16) as i16;
-            let amp = amplify(raw);
+            let quiet = amplify(raw).saturating_abs() < 16;
             if saving {
-                if !done && amp.saturating_abs() < 16 {
+                if !done && quiet {
                     saving = false;
                     mute = 1;
                     kept.clear();
@@ -230,7 +232,7 @@ fn discard_until_live(board: &mut Board, t0: Instant) -> Vec<i16> {
                 done = kept.len() >= live_need;
                 continue;
             }
-            if amp.saturating_abs() < 16 {
+            if quiet {
                 mute += 1;
                 continue;
             }
@@ -246,10 +248,7 @@ fn discard_until_live(board: &mut Board, t0: Instant) -> Vec<i16> {
             return kept;
         }
     }
-    step(
-        t0,
-        format!("[4/8] 2s 内未检测到有效声音，按空预录继续（超时读取 {empty_reads} 次）"),
-    );
+    step(t0, "[4/7] 2s 内未检测到有效声音，按空预录继续");
     Vec::new()
 }
 
@@ -275,7 +274,6 @@ impl HighPass {
     }
 }
 
-/// 高通滤波后的浮点样本乘以增益，并饱和到 i16。
 fn gain(sample: f32) -> i16 {
     (sample * GAIN as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
@@ -304,7 +302,5 @@ fn write_wav(path: &str, samples: &[i16]) -> std::io::Result<()> {
     for sample in samples {
         bytes.extend_from_slice(&sample.to_le_bytes());
     }
-    let mut file = File::create(path)?;
-    file.write_all(&bytes)?;
-    Ok(())
+    File::create(path)?.write_all(&bytes)
 }

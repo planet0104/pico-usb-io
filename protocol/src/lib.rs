@@ -2,7 +2,7 @@
 
 pub const SOF0: u8 = 0xA5;
 pub const SOF1: u8 = 0x5A;
-pub const PROTO_VERSION: u16 = 1;
+pub const PROTO_VERSION: u16 = 2;
 pub const PIN_COUNT: u8 = 30;
 pub const MAX_BODY: usize = 1024;
 pub const HEADER_LEN: usize = 8;
@@ -25,14 +25,39 @@ pub const OP_SPI_TRANSFER: u16 = 10;
 pub const OP_UART_CONFIG: u16 = 11;
 pub const OP_UART_WRITE: u16 = 12;
 pub const OP_UART_READ: u16 = 13;
-pub const OP_PULSE_PLAY: u16 = 14;
-pub const OP_PULSE_CAPTURE_START: u16 = 15;
-pub const OP_PULSE_CAPTURE_STOP: u16 = 16;
-pub const OP_BITSTREAM: u16 = 17;
-pub const OP_I2S_CONFIG: u16 = 18;
-pub const OP_I2S_READ: u16 = 19;
+pub const OP_PIO_LOAD: u16 = 20;
+pub const OP_PIO_UNLOAD: u16 = 21;
+pub const OP_PIO_SM_CONFIG: u16 = 22;
+pub const OP_PIO_SM_ENABLE: u16 = 23;
+pub const OP_PIO_SM_RESTART: u16 = 24;
+pub const OP_PIO_TX_PUSH: u16 = 25;
+pub const OP_PIO_RX_POP: u16 = 26;
+pub const OP_PIO_STREAM_START: u16 = 27;
+pub const OP_PIO_STREAM_STOP: u16 = 28;
+pub const OP_PIO_STREAM_STATUS: u16 = 29;
+pub const OP_PIO_STREAM_EVENT: u16 = 30;
 
-pub const EVT_PULSE: u16 = 1;
+pub const PIO_LOAD_AUTO: u8 = 1 << 0;
+
+pub const PIO_SM_CONFIG_LEN: usize = 24;
+pub const PIO_SIDESET_OPT: u8 = 1 << 0;
+pub const PIO_SIDESET_PINDIRS: u8 = 1 << 1;
+pub const PIO_OUT_SHIFT_RIGHT: u8 = 1 << 2;
+pub const PIO_IN_SHIFT_RIGHT: u8 = 1 << 3;
+pub const PIO_AUTOPULL: u8 = 1 << 4;
+pub const PIO_AUTOPUSH: u8 = 1 << 5;
+pub const PIO_JOIN_NONE: u8 = 0;
+pub const PIO_JOIN_TX: u8 = 1;
+pub const PIO_JOIN_RX: u8 = 2;
+pub const PIO_NO_PIN: u8 = 0xFF;
+
+pub const PIO_RESTART_CLKDIV: u8 = 1 << 0;
+pub const PIO_RESTART_FIFOS: u8 = 1 << 1;
+pub const PIO_RESTART_SM: u8 = 1 << 2;
+
+pub const PIO_TX_WAIT: u8 = 1 << 0;
+
+pub const PIO_STREAM_SPARSE: u8 = 1 << 0;
 
 pub const ST_OK: u8 = 0;
 pub const ST_BAD_FRAME: u8 = 1;

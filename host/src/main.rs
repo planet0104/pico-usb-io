@@ -1,7 +1,7 @@
 use std::thread;
 use std::time::Duration;
 
-use host::{BitTiming, Board};
+use host::Board;
 
 fn main() {
     println!("连接:");
@@ -45,11 +45,5 @@ fn extra(board: &mut Board) {
     let _ = board.spi_transfer(0, &[0x9F]);
     board.uart_config(8, 9, 115_200).unwrap();
     board.uart_write(1, b"hi").unwrap();
-    board.pulse_play(25, &[(1, 80_000), (0, 80_000)]).unwrap();
-    board.pulse_capture_start(6).unwrap();
-    thread::sleep(Duration::from_millis(30));
     let _ = board.gpio_read(7);
-    println!("edges {:?}", board.take_edges());
-    board.pulse_capture_stop(6).unwrap();
-    board.bitstream(16, BitTiming::ws2812(), &[0x00, 0x10, 0x00]).unwrap();
 }
