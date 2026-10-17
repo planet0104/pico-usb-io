@@ -6,6 +6,7 @@ mod pins;
 mod timing;
 
 use embassy_executor::Spawner;
+use embassy_futures::select::{select, Either};
 use embassy_rp::adc::{Adc, Channel};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::Pull;
@@ -74,8 +75,12 @@ async fn main(spawner: Spawner) {
             }
             if tx.dtr() {
                 host_ready = true;
-            } else if host_ready && board.timing.i2s_is_on() {
-                board.stop_i2s();
+            } else {
+                if host_ready && board.timing.i2s_is_on() {
+                    board.stop_i2s();
+                }
+                Timer::after(embassy_time::Duration::from_millis(1)).await;
+                continue;
             }
             board.timing.i2s_poll();
             if drain_events(&mut tx, &mut board).await.is_err() {
@@ -268,13 +273,46 @@ async fn write_frame(
     let mut sent = 0;
     while sent < n {
         let end = (sent + 64).min(n);
-        class.write_packet(&raw[sent..end]).await?;
+        write_packet(class, &raw[sent..end]).await?;
         sent = end;
     }
     if n % 64 == 0 {
-        class.write_packet(&[]).await?;
+        write_packet(class, &[]).await?;
     }
     Ok(())
+}
+
+async fn write_packet(class: &mut Sender<'static, MyUsbDriver>, data: &[u8]) -> Result<(), Gone> {
+    loop {
+        if !class.dtr() {
+            abort_in_transfers();
+            return Err(Gone);
+        }
+        match select(
+            class.write_packet(data),
+            Timer::after(embassy_time::Duration::from_millis(20)),
+        )
+        .await
+        {
+            Either::First(result) => return result.map_err(Into::into),
+            Either::Second(_) => {}
+        }
+    }
+}
+
+fn abort_in_transfers() {
+    let usb = embassy_rp::pac::USB;
+    usb.ep_abort().write(|w| {
+        for n in 1..16 {
+            w.set_ep_in(n, true);
+        }
+    });
+    for _ in 0..10000 {
+        let done = usb.ep_abort_done().read();
+        if (1..16).all(|n| done.ep_in(n)) {
+            break;
+        }
+    }
 }
 
 async fn drain_events(

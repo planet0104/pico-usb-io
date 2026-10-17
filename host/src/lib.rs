@@ -1,5 +1,9 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use io_proto::{
@@ -63,6 +67,9 @@ impl BitTiming {
 
 pub struct Board {
     port: Box<dyn SerialPort>,
+    incoming: Receiver<Vec<u8>>,
+    stop_read: Arc<AtomicBool>,
+    reader: Option<JoinHandle<()>>,
     parser: Parser,
     seq: u16,
     pending: Vec<PulseEdge>,
@@ -71,17 +78,56 @@ pub struct Board {
 
 impl Board {
     pub fn open(path: &str) -> Result<Self, Error> {
-        let port = serialport::new(path, 115_200)
-            .timeout(Duration::from_millis(1500))
+        let mut port = serialport::new(path, 115_200)
+            .timeout(Duration::from_millis(30))
             .dtr_on_open(true)
             .open()?;
+        let mut reader_port = port.try_clone()?;
+        let _ = port.set_timeout(Duration::from_millis(30));
+        let _ = reader_port.set_timeout(Duration::from_millis(30));
+        let (tx, incoming) = mpsc::channel();
+        let stop_read = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&stop_read);
+        let reader = thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            while !stop.load(Ordering::Relaxed) {
+                match reader_port.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(_) => break,
+                }
+            }
+        });
         Ok(Self {
             port,
+            incoming,
+            stop_read,
+            reader: Some(reader),
             parser: Parser::new(),
             seq: 1,
             pending: Vec::new(),
             audio: VecDeque::new(),
         })
+    }
+
+    fn shutdown(&mut self) {
+        self.stop_read.store(true, Ordering::Relaxed);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+
+    fn recv_chunk(&mut self, wait: Duration) -> Result<Option<Vec<u8>>, Error> {
+        match self.incoming.recv_timeout(wait) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => Err(Error::Timeout(0)),
+        }
     }
 
     pub fn version(&mut self) -> Result<Version, Error> {
@@ -220,16 +266,7 @@ impl Board {
     }
 
     pub fn release(mut self) {
-        let _ = self.port.set_timeout(Duration::from_millis(30));
-        let mut buf = [0u8; 256];
-        let start = std::time::Instant::now();
-        while start.elapsed() < Duration::from_millis(100) {
-            match self.port.read(&mut buf) {
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-        let _ = self.port.clear(serialport::ClearBuffer::All);
+        self.shutdown();
     }
 
     pub fn i2s_config(&mut self, bclk: u8, ws: u8, data: u8, frame_hz: u32) -> Result<(), Error> {
@@ -251,25 +288,20 @@ impl Board {
             return Ok(chunk);
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let mut scratch = [0u8; 512];
         while std::time::Instant::now() < deadline {
-            match self.port.read(&mut scratch) {
-                Ok(0) => return Err(Error::Timeout(0)),
-                Ok(n) => {
-                    let mut audio = Vec::new();
-                    self.parser.push(&scratch[..n], |frame| {
-                        if frame.kind == KIND_EVENT && frame.op == OP_I2S_READ && !frame.body.is_empty() {
-                            audio.push(frame.body.to_vec());
-                        }
-                    });
-                    if !audio.is_empty() {
-                        let first = audio.remove(0);
-                        self.audio.extend(audio);
-                        return Ok(first);
-                    }
+            let Some(got) = self.recv_chunk(Duration::from_millis(50))? else {
+                continue;
+            };
+            let mut audio = Vec::new();
+            self.parser.push(&got, |frame| {
+                if frame.kind == KIND_EVENT && frame.op == OP_I2S_READ && !frame.body.is_empty() {
+                    audio.push(frame.body.to_vec());
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(err) => return Err(err.into()),
+            });
+            if !audio.is_empty() {
+                let first = audio.remove(0);
+                self.audio.extend(audio);
+                return Ok(first);
             }
         }
         Err(Error::Timeout(0))
@@ -307,10 +339,8 @@ impl Board {
             &mut raw,
         )
         .expect("frame fits");
-        self.port.set_timeout(Duration::from_millis(50))?;
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let mut off = 0;
-        let mut scratch = [0u8; 1024];
         while std::time::Instant::now() < deadline {
             if off < n {
                 match self.port.write(&raw[off..n]) {
@@ -320,38 +350,40 @@ impl Board {
                     Err(err) => return Err(err.into()),
                 }
             }
-            match self.port.read(&mut scratch) {
-                Ok(0) => return Err(Error::Timeout(seq)),
-                Ok(got) => {
-                    let mut found = None;
-                    let mut edges = Vec::new();
-                    let mut audio = Vec::new();
-                    self.parser.push(&scratch[..got], |frame| {
-                        if frame.kind == KIND_EVENT && frame.op == EVT_PULSE && frame.body.len() >= 6 {
-                            edges.push(PulseEdge {
-                                pin: frame.body[0],
-                                level: frame.body[1],
-                                width_us: u32::from_le_bytes(frame.body[2..6].try_into().unwrap()),
-                            });
-                        } else if frame.kind == KIND_EVENT && frame.op == OP_I2S_READ && !frame.body.is_empty() {
-                            audio.push(frame.body.to_vec());
-                        } else if frame.kind == KIND_RESP && frame.seq == seq {
-                            found = Some((frame.status, frame.body.to_vec()));
-                        }
+            let Some(got) = self.recv_chunk(Duration::from_millis(20))? else {
+                continue;
+            };
+            let mut found = None;
+            let mut edges = Vec::new();
+            let mut audio = Vec::new();
+            self.parser.push(&got, |frame| {
+                if frame.kind == KIND_EVENT && frame.op == EVT_PULSE && frame.body.len() >= 6 {
+                    edges.push(PulseEdge {
+                        pin: frame.body[0],
+                        level: frame.body[1],
+                        width_us: u32::from_le_bytes(frame.body[2..6].try_into().unwrap()),
                     });
-                    self.pending.extend(edges);
-                    self.audio.extend(audio);
-                    if let Some((status, body)) = found {
-                        if status != ST_OK {
-                            return Err(Error::Status(status));
-                        }
-                        return Ok(body);
-                    }
+                } else if frame.kind == KIND_EVENT && frame.op == OP_I2S_READ && !frame.body.is_empty() {
+                    audio.push(frame.body.to_vec());
+                } else if frame.kind == KIND_RESP && frame.seq == seq {
+                    found = Some((frame.status, frame.body.to_vec()));
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(err) => return Err(err.into()),
+            });
+            self.pending.extend(edges);
+            self.audio.extend(audio);
+            if let Some((status, body)) = found {
+                if status != ST_OK {
+                    return Err(Error::Status(status));
+                }
+                return Ok(body);
             }
         }
         Err(Error::Timeout(seq))
+    }
+}
+
+impl Drop for Board {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }

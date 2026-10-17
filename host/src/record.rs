@@ -129,25 +129,24 @@ fn amplify(sample: i16) -> i16 {
 }
 
 fn write_wav(path: &str, samples: &[i16]) -> std::io::Result<()> {
-    let mut file = std::io::BufWriter::new(File::create(path)?);
     let data_len = (samples.len() * 2) as u32;
-    let mut hdr = Vec::with_capacity(44);
-    hdr.extend_from_slice(b"RIFF");
-    hdr.extend_from_slice(&(36 + data_len).to_le_bytes());
-    hdr.extend_from_slice(b"WAVEfmt ");
-    hdr.extend_from_slice(&16u32.to_le_bytes());
-    hdr.extend_from_slice(&1u16.to_le_bytes());
-    hdr.extend_from_slice(&1u16.to_le_bytes());
-    hdr.extend_from_slice(&RATE.to_le_bytes());
-    hdr.extend_from_slice(&(RATE * 2).to_le_bytes());
-    hdr.extend_from_slice(&2u16.to_le_bytes());
-    hdr.extend_from_slice(&16u16.to_le_bytes());
-    hdr.extend_from_slice(b"data");
-    hdr.extend_from_slice(&data_len.to_le_bytes());
-    file.write_all(&hdr)?;
+    let mut bytes = Vec::with_capacity(44 + samples.len() * 2);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&RATE.to_le_bytes());
+    bytes.extend_from_slice(&(RATE * 2).to_le_bytes());
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.extend_from_slice(&16u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_len.to_le_bytes());
     for sample in samples {
-        file.write_all(&sample.to_le_bytes())?;
+        bytes.extend_from_slice(&sample.to_le_bytes());
     }
-    file.flush()?;
+    let mut file = File::create(path)?;
+    file.write_all(&bytes)?;
     Ok(())
 }
