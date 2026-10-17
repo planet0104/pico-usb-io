@@ -7,8 +7,11 @@
 //! 用法：st7789.bat COM13 [SCK脚] [MOSI脚] [DC脚] [RST脚] [CS脚|none] [旋转 0..3] [秒数]
 //! 默认 GP10(SCK) / GP11(MOSI) / GP12(DC) / GP13(RES)，CS 不接、把模块的 CS 接到 GND。
 //!
-//! ST7789 控制器的显存是 240×320，而面板只有 240×240，所以写窗口时要按旋转方向补一个
-//! 偏移（见 `Panel::xoff/yoff`）：偏移错了会整屏空白或错位。
+//! ST7789 控制器的显存是 240×320，而面板只有 240×240：旋转 0、1 不用偏移，
+//! 旋转 2、3 要补 80（见 `Panel::xoff/yoff`），偏移错了画面会错位。
+//!
+//! 无 CS 脚的 240×240 模块要用 SPI 模式 3（CPOL=1，CPHA=1）。
+//! DC 只在发命令字节时拉低，参数和像素数据都要在 DC 拉高后发送。
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,6 +22,8 @@ const W: usize = 240;
 const H: usize = 240;
 /// ST7789 最高可到 62.5 MHz；这里取 24 MHz，长杜邦线也稳。
 const SPI_HZ: u32 = 24_000_000;
+/// SPI 模式 3：时钟空闲为高，第二个边沿采样。
+const SPI_MODE: u8 = 3;
 /// 单次 SPI 传输最多带多少数据字节：协议 body 上限 1024，扣掉 1 字节总线号。
 const CHUNK: usize = 1000;
 /// 弹球方块边长（像素）和每帧移动距离
@@ -43,11 +48,14 @@ struct Panel {
 }
 
 impl Panel {
-    /// 发命令（含参数）：DC 拉低、发完再拉高。
-    fn cmd(&self, board: &mut Board, bytes: &[u8]) -> Result<(), Error> {
+    /// 发一条命令：DC 拉低只发命令字节，再拉高发参数。结束时 DC 保持高，后面可以直接发数据。
+    fn cmd(&self, board: &mut Board, c: u8, params: &[u8]) -> Result<(), Error> {
         board.gpio_write(self.dc, false)?;
-        board.spi_transfer(self.bus, bytes)?;
+        board.spi_transfer(self.bus, &[c])?;
         board.gpio_write(self.dc, true)?;
+        if !params.is_empty() {
+            board.spi_transfer(self.bus, params)?;
+        }
         Ok(())
     }
 
@@ -59,25 +67,16 @@ impl Panel {
         Ok(())
     }
 
-    /// 设置写窗口并进入写显存状态（CASET / RASET / RAMWR 一次发完）。
+    /// 设置写窗口（CASET 列 / RASET 行，起止坐标都是大端 u16）并进入写显存状态（RAMWR）。
     fn set_window(&self, board: &mut Board, x: i32, y: i32, w: i32, h: i32) -> Result<(), Error> {
         let xs = x as u16 + self.xoff;
         let ys = y as u16 + self.yoff;
         let xe = xs + w as u16 - 1;
         let ye = ys + h as u16 - 1;
-        let mut c = [0u8; 11];
-        c[0] = 0x2A;
-        c[1] = (xs >> 8) as u8;
-        c[2] = xs as u8;
-        c[3] = (xe >> 8) as u8;
-        c[4] = xe as u8;
-        c[5] = 0x2B;
-        c[6] = (ys >> 8) as u8;
-        c[7] = ys as u8;
-        c[8] = (ye >> 8) as u8;
-        c[9] = ye as u8;
-        c[10] = 0x2C;
-        self.cmd(board, &c)
+        let range = |s: u16, e: u16| [(s >> 8) as u8, s as u8, (e >> 8) as u8, e as u8];
+        self.cmd(board, 0x2A, &range(xs, xe))?;
+        self.cmd(board, 0x2B, &range(ys, ye))?;
+        self.cmd(board, 0x2C, &[])
     }
 
     /// 往一个矩形区域写数据（调用前先 set_window）。
@@ -87,9 +86,9 @@ impl Panel {
     }
 }
 
-/// 上电复位 + 初始化。时序取自 ST7789 常见 240×240 模块的通用初始化序列。
-fn init(panel: &Panel, board: &mut Board, rst: u8) -> Result<(), Error> {
-    // 硬复位：拉低 20 ms 再拉高
+/// 上电复位 + 初始化，序列与 rp2040_usb_screen 项目驱动同一块屏时一致。
+fn init(panel: &Panel, board: &mut Board, rst: u8, madctl: u8) -> Result<(), Error> {
+    // 硬复位：拉低 20 ms 再拉高，等芯片起来
     board.pin_output(rst, true)?;
     thread::sleep(Duration::from_millis(10));
     board.pin_output(rst, false)?;
@@ -97,39 +96,17 @@ fn init(panel: &Panel, board: &mut Board, rst: u8) -> Result<(), Error> {
     board.pin_output(rst, true)?;
     thread::sleep(Duration::from_millis(120));
 
-    let steps: &[(u8, &[u8])] = &[
-        (0x01, &[]),                                        // SWRESET 软复位
-        (0x11, &[]),                                        // SLPOUT 退出睡眠
-        (0x3A, &[0x55]),                                    // COLMOD：16 位色
-        (0xB2, &[0x0C, 0x0C, 0x00, 0x33, 0x33]),            // PORCTRL 前后沿
-        (0xB7, &[0x35]),                                    // GCTRL 门极控制
-        (0xBB, &[0x19]),                                    // VCOMS 公共电压
-        (0xC0, &[0x2C]),                                    // LCMCTRL
-        (0xC2, &[0x01]),                                    // VDVVRHEN
-        (0xC3, &[0x12]),                                    // VRHS
-        (0xC4, &[0x20]),                                    // VDVS
-        (0xC6, &[0x0F]),                                    // FRCTRL2 帧率
-        (0xD0, &[0xA4, 0xA1]),                              // PWCTRL1
-        (0xE0, &[0xD0, 0x04, 0x0D, 0x11, 0x13, 0x2B, 0x3F, 0x54, 0x4C, 0x18, 0x0D, 0x0B, 0x1F, 0x23]), // 正极性伽马
-        (0xE1, &[0xD0, 0x04, 0x0C, 0x11, 0x13, 0x2C, 0x3F, 0x44, 0x51, 0x2F, 0x1F, 0x1F, 0x20, 0x23]), // 负极性伽马
-        (0x21, &[]),                                        // INVON：IPS 屏要反色
-    ];
-    for (c, d) in steps {
-        let mut buf = Vec::with_capacity(1 + d.len());
-        buf.push(*c);
-        buf.extend_from_slice(d);
-        panel.cmd(board, &buf)?;
-        // 这两条命令之后芯片需要时间，别的命令不用等。
-        match *c {
-            0x01 => thread::sleep(Duration::from_millis(150)),
-            0x11 => thread::sleep(Duration::from_millis(120)),
-            _ => {}
-        }
-    }
-    panel.cmd(board, &[0x13])?; // NORON 正常显示模式
+    panel.cmd(board, 0x01, &[])?; // SWRESET 软复位
+    thread::sleep(Duration::from_millis(150));
+    panel.cmd(board, 0x11, &[])?; // SLPOUT 退出睡眠
+    thread::sleep(Duration::from_millis(120));
+    panel.cmd(board, 0x20, &[])?; // INVOFF 不反色；如果黑白颠倒，改成 0x21（INVON）
+    panel.cmd(board, 0x36, &[madctl])?; // MADCTL 扫描方向（旋转）
+    panel.cmd(board, 0x3A, &[0x55])?; // COLMOD 16 位色 RGB565
+    panel.cmd(board, 0x13, &[])?; // NORON 正常显示模式
     thread::sleep(Duration::from_millis(10));
-    panel.cmd(board, &[0x29])?; // DISPON 开显示
-    thread::sleep(Duration::from_millis(100));
+    panel.cmd(board, 0x29, &[])?; // DISPON 开显示
+    thread::sleep(Duration::from_millis(10));
     Ok(())
 }
 
@@ -248,15 +225,15 @@ fn main() -> Result<(), Error> {
         2 | 6 | 18 | 22 => 0,
         _ => 1,
     };
-    board.spi_config(sck, mosi, None, SPI_HZ, 0)?;
+    board.spi_config(sck, mosi, None, SPI_HZ, SPI_MODE)?;
     if let Some(cs) = cs {
         board.pin_output(cs, false)?;
     }
 
-    // 旋转决定 MADCTL 和写窗口偏移（240×240 面板只看显存里的 240 行，要补 80 行）
+    // 旋转决定 MADCTL 和写窗口偏移：旋转 0、1 面板对着显存开头，2、3 要跳过多出的 80 行 / 列。
     let (madctl, xoff, yoff) = match rot {
-        0 => (0x00u8, 0u16, 80u16),
-        1 => (0x60, 80, 0),
+        0 => (0x00u8, 0u16, 0u16),
+        1 => (0x60, 0, 0),
         2 => (0xC0, 0, 80),
         _ => (0xA0, 80, 0),
     };
@@ -267,9 +244,11 @@ fn main() -> Result<(), Error> {
         yoff,
     };
 
-    init(&panel, &mut board, rst)?;
-    panel.cmd(&mut board, &[0x36, madctl])?;
-    println!("初始化完成：SPI {bus} @ {} MHz，旋转 {rot}，窗口偏移 ({xoff},{yoff})", SPI_HZ / 1_000_000);
+    init(&panel, &mut board, rst, madctl)?;
+    println!(
+        "初始化完成：SPI {bus} @ {} MHz 模式 {SPI_MODE}，旋转 {rot}，窗口偏移 ({xoff},{yoff})",
+        SPI_HZ / 1_000_000
+    );
 
     // 全屏画一次测试图案，验证整屏写窗口 + 分块传输
     let mut fb = vec![0u8; W * H * 2];
@@ -302,7 +281,7 @@ fn main() -> Result<(), Error> {
     }
     let secs_f = t0.elapsed().as_secs_f64();
     println!(
-        "动画结束：{frame} 帧 / {secs_f:.1} s = {:.1} fps（每帧 2 个区域、约 12 次往返）",
+        "动画结束：{frame} 帧 / {secs_f:.1} s = {:.1} fps（每帧 2 个区域）",
         frame as f64 / secs_f
     );
     println!("关机完成（CS 拉低不影响显示，屏会保持最后一帧）");
