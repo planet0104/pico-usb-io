@@ -144,6 +144,9 @@ async fn usb_reader(mut rx: Receiver<'static, MyUsbDriver>) -> ! {
         loop {
             match rx.read_packet(&mut packet).await {
                 Ok(n) => {
+                    if parser.is_idle() && is_bootsel_text(&packet[..n]) {
+                        embassy_rp::rom_data::reset_to_usb_boot(0, 0);
+                    }
                     parser.push(&packet[..n], |frame| {
                         if frame.kind == KIND_REQ {
                             push_cmd(&frame);
@@ -157,6 +160,12 @@ async fn usb_reader(mut rx: Receiver<'static, MyUsbDriver>) -> ! {
             }
         }
     }
+}
+
+/// 串口工具里手动发送的文本指令 `BOOTSEL`（不区分大小写，可带换行）：重启进 U 盘烧录模式。
+/// 只认"整个 USB 包就是这个词、且没有收了一半的协议帧"的情况，正常的协议数据不会误触发。
+fn is_bootsel_text(data: &[u8]) -> bool {
+    data.trim_ascii().eq_ignore_ascii_case(b"BOOTSEL")
 }
 
 /// 请求帧的拷贝。解析器回调里的 body 只是借用，放进队列前要复制出来。

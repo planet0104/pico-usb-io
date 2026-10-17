@@ -178,6 +178,11 @@ impl Parser {
         }
     }
 
+    /// 缓冲区里没有收了一半的帧。
+    pub fn is_idle(&self) -> bool {
+        self.len == 0
+    }
+
     /// 喂入一段收到的字节，每解出一帧调用一次 `on_frame`。
     pub fn push(&mut self, data: &[u8], mut on_frame: impl for<'a> FnMut(Frame<'a>)) {
         for &b in data {
