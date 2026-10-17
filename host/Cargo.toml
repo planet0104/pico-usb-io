@@ -40,3 +40,7 @@ path = "src/touch.rs"
 [[bin]]
 name = "oled"
 path = "src/oled.rs"
+
+[[bin]]
+name = "stepper"
+path = "src/stepper.rs"
