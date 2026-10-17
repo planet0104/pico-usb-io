@@ -173,17 +173,15 @@ fn crop(fb: &[u8], x: i32, y: i32, w: i32, h: i32) -> Vec<u8> {
     out
 }
 
-/// 纯色矩形。
-fn solid(c: u16, w: i32, h: i32) -> Vec<u8> {
-    let mut row = Vec::with_capacity(w as usize * 2);
-    for _ in 0..w {
-        row.extend_from_slice(&[(c >> 8) as u8, c as u8]);
+/// 在一块 `w` 宽的区域缓冲里，从 (x, y) 起画一个 `size` 见方的纯色方块（坐标相对区域左上角）。
+fn paint_box(region: &mut [u8], w: i32, x: i32, y: i32, size: i32, c: u16) {
+    for row in y..y + size {
+        for col in x..x + size {
+            let i = ((row * w + col) * 2) as usize;
+            region[i] = (c >> 8) as u8;
+            region[i + 1] = c as u8;
+        }
     }
-    let mut out = Vec::with_capacity((w * h * 2) as usize);
-    for _ in 0..h {
-        out.extend_from_slice(&row);
-    }
-    out
 }
 
 fn main() -> Result<(), Error> {
@@ -262,26 +260,26 @@ fn main() -> Result<(), Error> {
         fb.len().div_ceil(CHUNK)
     );
 
-    // 弹球动画：只更新新旧两个方块区域，避免每帧整屏重传
+    // 弹球动画：每帧只写一次"旧位置 ∪ 新位置"的包围矩形，内容是背景加新方块。
+    // 分成"先擦旧的、再画新的"两次写，屏幕会扫到方块不在的那一刻，看起来一直在闪。
     println!("弹球动画 {secs} 秒……");
     let mut prev = (0i32, 0i32);
     let mut frame = 0u64;
-    let bg_box = (BOX, BOX);
-    let solid_box = solid(BLACK, BOX, BOX);
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(secs) {
         let bx = bounce(frame as i32 * SPEED, W as i32 - BOX - 2);
         let by = bounce(frame as i32 * SPEED * 2 / 3, H as i32 - BOX - 2);
-        // 先擦掉旧位置（从背景显存取像素），再画新位置
-        let old = crop(&fb, prev.0, prev.1, bg_box.0, bg_box.1);
-        panel.blit(&mut board, prev.0, prev.1, bg_box.0, bg_box.1, &old)?;
-        panel.blit(&mut board, bx, by, BOX, BOX, &solid_box)?;
+        let (x0, y0) = (prev.0.min(bx), prev.1.min(by));
+        let (w, h) = (prev.0.max(bx) + BOX - x0, prev.1.max(by) + BOX - y0);
+        let mut region = crop(&fb, x0, y0, w, h);
+        paint_box(&mut region, w, bx - x0, by - y0, BOX, BLACK);
+        panel.blit(&mut board, x0, y0, w, h, &region)?;
         prev = (bx, by);
         frame += 1;
     }
     let secs_f = t0.elapsed().as_secs_f64();
     println!(
-        "动画结束：{frame} 帧 / {secs_f:.1} s = {:.1} fps（每帧 2 个区域）",
+        "动画结束：{frame} 帧 / {secs_f:.1} s = {:.1} fps",
         frame as f64 / secs_f
     );
     println!("关机完成（CS 拉低不影响显示，屏会保持最后一帧）");
