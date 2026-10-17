@@ -256,7 +256,7 @@ impl Board {
 - `PioProgram` 记录装载位置和 side-set 信息，`pio_sm_config` 据此填 side-set 字段。
 - `SmConfig` 与 `OP_PIO_SM_CONFIG` 一一对应，实现了 `Default`。
 - `pio_tx_push` 自动按 255 字分帧并带 `PIO_TX_WAIT`，一次也推不进去时返回 `ST_BUSY`。
-- 串口由后台线程持续读取，流事件帧进入队列；`call()` 期间收到的流帧也入队，不丢。
+- 串口读写都在调用者线程里按顺序进行（先写完请求再读应答），不另开读线程：Windows 同步串口句柄上的读和写会被系统排队，后台挂着的读会让每条命令多等一个读超时。`call()` 期间收到的流帧放进队列，不丢。
 
 ### 6.3 分频计算
 

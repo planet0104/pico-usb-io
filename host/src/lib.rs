@@ -7,10 +7,6 @@
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub use io_proto::{
@@ -141,16 +137,17 @@ pub fn clkdiv(freq_hz: u32) -> (u16, u8) {
     (int as u16, frac as u8)
 }
 
+/// 串口单次读 / 写的超时。读到数据会立即返回，这个值只决定"没数据时最多等多久"。
+const IO_TIMEOUT: Duration = Duration::from_millis(5);
+
 /// 一块已连接的板子。
 ///
-/// 串口由后台线程持续读取，读到的字节通过通道交给主线程解析。这样做是因为固件推流时
-/// 会源源不断地发数据：如果只在等应答时才读串口，Windows 的 USB 串口缓冲一满，
-/// 我们发出的命令也会被卡住，两边互相等待导致卡死。
+/// 读写都在调用者的线程里按顺序进行：先把请求写完，再读应答。不能另开线程一直挂着读：
+/// Windows 上串口是同步句柄，同一个句柄（包括 try_clone 复制出来的）上的读和写会被系统排队，
+/// 后台线程的读没超时之前，主线程的写就发不出去，每条命令要多等几十毫秒。
+/// 固件用独立任务收命令，即使上位机暂时不读，板子也能收下请求，不会互相等待。
 pub struct Board {
     port: Box<dyn SerialPort>,
-    incoming: Receiver<Vec<u8>>,
-    stop_read: Arc<AtomicBool>,
-    reader: Option<JoinHandle<()>>,
     parser: Parser,
     seq: u16,
     /// 已收到但还没被 `read_stream` 取走的流数据。
@@ -162,53 +159,19 @@ impl Board {
     /// 打开时置 DTR，固件据此判断上位机已连接；关闭后 DTR 消失，固件会自动停掉 PIO。
     pub fn open(path: &str) -> Result<Self, Error> {
         let port = serialport::new(path, 115_200)
-            .timeout(Duration::from_millis(30))
+            .timeout(IO_TIMEOUT)
             .dtr_on_open(true)
             .open()?;
-        let mut reader_port = port.try_clone()?;
-        let (tx, incoming) = mpsc::channel();
-        let stop_read = Arc::new(AtomicBool::new(false));
-        let stop = Arc::clone(&stop_read);
-        let reader = thread::spawn(move || {
-            let mut buf = [0u8; 1024];
-            while !stop.load(Ordering::Relaxed) {
-                match reader_port.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
-                    Err(err) => {
-                        eprintln!("[board] 后台读线程读取出错，退出: {err}");
-                        break;
-                    }
-                }
-            }
-        });
         Ok(Self {
             port,
-            incoming,
-            stop_read,
-            reader: Some(reader),
             parser: Parser::new(),
             seq: 1,
             stream: VecDeque::new(),
         })
     }
 
-    /// 主动关闭：停止后台读线程并关掉串口。Drop 时也会自动做同样的事。
-    pub fn release(mut self) {
-        self.shutdown();
-    }
-
-    fn shutdown(&mut self) {
-        self.stop_read.store(true, Ordering::Relaxed);
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
-    }
+    /// 主动关闭串口。直接丢弃 `Board` 也会关闭。
+    pub fn release(self) {}
 
     /// 查询协议版本、固件版本和引脚数，也可以用来确认连上的是不是这块板子。
     pub fn version(&mut self) -> Result<Version, Error> {
@@ -490,30 +453,46 @@ impl Board {
             if left.is_zero() {
                 return Err(Error::Timeout(0));
             }
-            let Some(got) = self.recv_chunk(left.min(Duration::from_millis(50)))? else {
-                continue;
-            };
-            let mut chunks = Vec::new();
-            self.parser.push(&got, |frame| {
-                if frame.kind == KIND_EVENT && frame.op == OP_PIO_STREAM_EVENT && !frame.body.is_empty() {
-                    chunks.push(words(frame.body));
-                }
-            });
-            self.stream.extend(chunks);
+            if let Some(got) = self.recv_chunk(left)? {
+                self.absorb(&got, 0);
+            }
         }
     }
 
-    /// 从后台读线程取一块原始字节；`wait` 内没有数据返回 None，读线程已退出返回错误。
+    /// 读一块原始字节，有数据立即返回；`wait` 内一直没有数据返回 None。
     fn recv_chunk(&mut self, wait: Duration) -> Result<Option<Vec<u8>>, Error> {
-        match self.incoming.recv_timeout(wait) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(RecvTimeoutError::Timeout) => Ok(None),
-            Err(RecvTimeoutError::Disconnected) => Err(Error::Timeout(0)),
+        let deadline = Instant::now() + wait;
+        let mut buf = [0u8; 4096];
+        loop {
+            match self.port.read(&mut buf) {
+                Ok(0) => {}
+                Ok(n) => return Ok(Some(buf[..n].to_vec())),
+                Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(err) => return Err(err.into()),
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
         }
+    }
+
+    /// 解析收到的字节：流数据放进队列；遇到序号为 `seq` 的应答就返回 (status, body)。
+    fn absorb(&mut self, bytes: &[u8], seq: u16) -> Option<(u8, Vec<u8>)> {
+        let mut found = None;
+        let mut chunks = Vec::new();
+        self.parser.push(bytes, |frame| {
+            if frame.kind == KIND_EVENT && frame.op == OP_PIO_STREAM_EVENT && !frame.body.is_empty() {
+                chunks.push(words(frame.body));
+            } else if frame.kind == KIND_RESP && frame.seq == seq {
+                found = Some((frame.status, frame.body.to_vec()));
+            }
+        });
+        self.stream.extend(chunks);
+        found
     }
 
     /// 发一条请求并等待对应 seq 的应答（最多 3 秒），返回应答 body。
-    /// 写串口和读数据交替进行，等待期间收到的流数据会放进队列，不会丢。
+    /// 等待期间收到的流数据会放进队列，不会丢。
     fn call(&mut self, op: u16, body: &[u8]) -> Result<Vec<u8>, Error> {
         if body.len() > MAX_BODY {
             return Err(Error::Status(io_proto::ST_NO_SPACE));
@@ -534,28 +513,27 @@ impl Board {
         .expect("frame fits");
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut off = 0;
-        while Instant::now() < deadline {
+        while off < n {
+            match self.port.write(&raw[off..n]) {
+                Ok(k) => off += k,
+                Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(err) => return Err(err.into()),
+            }
             if off < n {
-                match self.port.write(&raw[off..n]) {
-                    Ok(k) => off += k,
-                    Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
-                    Err(err) => return Err(err.into()),
+                if Instant::now() >= deadline {
+                    return Err(Error::Timeout(seq));
+                }
+                // 板子暂时收不下（例如正在做耗时的 I2C），顺便把已到的流数据读走。
+                if let Some(got) = self.recv_chunk(Duration::ZERO)? {
+                    self.absorb(&got, 0);
                 }
             }
+        }
+        while Instant::now() < deadline {
             let Some(got) = self.recv_chunk(Duration::from_millis(20))? else {
                 continue;
             };
-            let mut found = None;
-            let mut chunks = Vec::new();
-            self.parser.push(&got, |frame| {
-                if frame.kind == KIND_EVENT && frame.op == OP_PIO_STREAM_EVENT && !frame.body.is_empty() {
-                    chunks.push(words(frame.body));
-                } else if frame.kind == KIND_RESP && frame.seq == seq {
-                    found = Some((frame.status, frame.body.to_vec()));
-                }
-            });
-            self.stream.extend(chunks);
-            if let Some((status, body)) = found {
+            if let Some((status, body)) = self.absorb(&got, seq) {
                 if status != ST_OK {
                     return Err(Error::Status(status));
                 }
@@ -563,12 +541,6 @@ impl Board {
             }
         }
         Err(Error::Timeout(seq))
-    }
-}
-
-impl Drop for Board {
-    fn drop(&mut self) {
-        self.shutdown();
     }
 }
 
