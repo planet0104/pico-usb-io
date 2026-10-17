@@ -24,3 +24,7 @@ path = "src/ws2812.rs"
 [[bin]]
 name = "servo"
 path = "src/servo.rs"
+
+[[bin]]
+name = "ir"
+path = "src/ir.rs"
