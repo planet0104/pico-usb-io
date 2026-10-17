@@ -44,3 +44,7 @@ path = "src/oled.rs"
 [[bin]]
 name = "stepper"
 path = "src/stepper.rs"
+
+[[bin]]
+name = "st7789"
+path = "src/st7789.rs"
