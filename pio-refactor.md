@@ -137,9 +137,9 @@ origin/count 与装载记录不符返回 `ST_BAD_ARG`；有已使能的 SM 正�
 
 固件处理顺序：
 
-1. 计算 out/set/in/sideset 区间与 jmp_pin 涉及的引脚集合；任何引脚 ≥30 返回 `ST_BAD_PIN`，`out_pindir_mask` 含集合外引脚返回 `ST_BAD_ARG`。
-2. 对这些引脚做 `Role` 仲裁（释放旧角色），funcsel 设为对应 PIO。
-3. 停用该 SM；若它正在流，先停流。
+1. 完整校验 body，不改任何状态：程序是否已装载、分频、side-set 位数、阈值、fifo_join 等不合法返回 `ST_BAD_ARG`；out/set/in/sideset 区间与 jmp_pin 中任一引脚 ≥30 返回 `ST_BAD_PIN`；`out_pindir_mask` 含集合外引脚返回 `ST_BAD_ARG`。校验失败时引脚原来的功能不受影响。
+2. 对用到的引脚做 `Role` 仲裁（释放旧角色）。
+3. 若该 SM 正在流，先停流；停用该 SM；把引脚 funcsel 设为对应 PIO。
 4. 写 CLKDIV / EXECCTRL / SHIFTCTRL，逐个引脚执行 `SET PINDIRS` 设方向，再写 PINCTRL。
 5. 清 FIFO，执行 `JMP origin`。
 
@@ -321,11 +321,19 @@ right_skip:
 
 使用 pico-examples 的 4 条指令程序（`.side_set 1`，每位 10 个周期），PIO 时钟 8 MHz 即 800 kHz 位率；`autopull`、`pull_thresh=24`、`fifo_join=tx`。每个 LED 一个字：三个颜色字节放在 bit31..8，按板子实测的 RGB 顺序。FIFO 空时停在 `out`，引脚保持低电平，即复位码。结束时停用 SM、引脚拉低、卸载程序。
 
-### 7.3 与改造前的差异
+### 7.3 舵机（`host/src/servo.rs`）
+
+PIO 时钟 1 MHz，用 `set pins` 输出 50 Hz 脉冲。每个字低 16 位是高电平计数、高 16 位是低电平计数（`out_shift_right`）；程序用 `pull noblock`，FIFO 空时重复上一个字，所以上位机只在角度变化时推一次，电脑定时抖动不会让脉冲中断。程序每周期有 8 条额外指令，`pulse_word()` 扣掉这部分开销。使能前必须先推第一个字，否则 X=0 会输出极窄的脉冲。
+
+### 7.4 红外接收（`host/src/ir.rs`）
+
+PIO 跑在 125 MHz，用 `wait pin` / `jmp pin` 交替测量高、低电平段的长度（每轮 2 个周期），每段推一个计数值；用稀疏流回传，上位机换算成微秒，按 NEC 协议解码按键。这替代了改造前固件内建的脉冲捕获功能。
+
+### 7.5 与改造前的差异
 
 - `WS=SCK+1`、采样率范围、颜色字节顺序等检查与约定全部在上位机。
 - 停止后的引脚电平由上位机负责设置。
-- 旧的脉冲收发与边沿事件不再提供；需要时由上位机写边沿计时 PIO 程序，用稀疏流回传。
+- 旧的脉冲收发与边沿事件不再由固件提供，改为上位机的 PIO 程序（7.3 舵机输出、7.4 红外边沿测量）。
 
 ---
 
@@ -361,5 +369,6 @@ right_skip:
 2. **稳定性**：连续录制 3 次以上、每次 15 s，不拔插 USB，不出现卡顿、保存延迟、第二次无法启动或静音。
 3. **异常退出**：录音中途关掉程序，再次运行应能正常启动（验证 DTR 掉线 reset）。
 4. **WS2812**：`ws2812.bat` 依次显示红、绿、蓝、灭。
-5. **基础功能**：`blink.bat` 行为不变。
-6. **边界**：指令内存装满返回 `ST_NO_SPACE`、卸载后可再装；非法引脚返回 `ST_BAD_PIN`；重复启动流返回 `ST_BUSY`；发送旧 op 14–19 返回 `ST_BAD_ARG`。
+5. **舵机 / 红外**：`servo.bat` 能转到指定角度并保持不抖；`ir.bat` 按遥控器能打印对应按键。
+6. **基础功能**：`blink.bat` 行为不变。
+7. **边界**：指令内存装满返回 `ST_NO_SPACE`、卸载后可再装；非法引脚返回 `ST_BAD_PIN`；重复启动流返回 `ST_BUSY`；发送旧 op 14–19 返回 `ST_BAD_ARG`。

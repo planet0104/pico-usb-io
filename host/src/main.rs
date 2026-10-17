@@ -1,3 +1,7 @@
+//! 最简单的示例：让 GP25（官方 Pico 板载 LED）闪 3 次，确认通讯正常。
+//!
+//! 用法：`blink.bat COM13`。设置环境变量 DEMO=1 时还会顺带调用一遍各个基础外设接口。
+
 use std::thread;
 use std::time::Duration;
 
@@ -35,6 +39,10 @@ fn main() {
     }
 }
 
+/// 基础外设接口的调用示范（引脚只是示例，按实际接线修改）。
+/// 依次是：GP15 输出 1 kHz、25% 的 PWM；读 GP26 的 ADC；在 GP4/5 上打开 I2C 并向 0x3C 写一个字节；
+/// 在 GP18/19/16 上打开 SPI，GP17 当片选拉低后发 0x9F（常见 Flash 的读 ID 命令）；
+/// 在 GP8/9 上打开 UART1 并发送 "hi"。
 fn extra(board: &mut Board) {
     board.pwm_set(15, 1_000, 250).unwrap();
     println!("adc26 {}", board.adc_read(26).unwrap());

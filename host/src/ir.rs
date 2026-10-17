@@ -1,3 +1,10 @@
+//! 红外接收示例：用 PIO 测量红外接收头输出的每段高 / 低电平时长，在电脑上按 NEC 协议解码按键。
+//!
+//! PIO 只负责计时，测到一段就推一个计数值进 RX FIFO；固件用稀疏流把这些数发回来，
+//! 解码、去重、按键名映射全部在上位机完成。
+//!
+//! 用法：`ir.bat COM13 [信号脚] [监听秒数]`。
+
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -5,6 +12,7 @@ use host::{
     Board, Program, SmConfig, PIO_JOIN_NONE, PIO_RESTART_CLKDIV, PIO_RESTART_FIFOS, PIO_RESTART_SM,
 };
 
+/// 使用 PIO0 的状态机 0。
 const PIO: u8 = 0;
 const SM: u8 = 0;
 const DEFAULT_PIN: u8 = 15;
@@ -76,9 +84,11 @@ fn nec_name(cmd: u8) -> Option<&'static str> {
     })
 }
 
+/// NEC 解码器：收集一帧内的 33 个高电平段（引导间隔 + 32 位），帧结束时校验并上报按键。
 struct Decoder {
     /// 只保留高电平段（间隔）
     spaces: VecDeque<u64>,
+    /// 上一次上报的按键和时间，用于过滤长按产生的重复帧。
     last: Option<(u8, Instant)>,
 }
 
@@ -106,6 +116,7 @@ impl Decoder {
             self.spaces.push_back(us);
             return;
         }
+        // 普通位间隔：只保留最近 33 个，防止噪声让队列无限增长。
         self.spaces.push_back(us);
         while self.spaces.len() > 33 {
             self.spaces.pop_front();
@@ -118,6 +129,7 @@ impl Decoder {
         if spaces.len() != 33 || !(3_500..=5_500).contains(&spaces[0]) {
             return None;
         }
+        // NEC 低位先发，第 i 个间隔就是第 i 位。
         let mut code = 0u32;
         for (i, &s) in spaces.iter().skip(1).enumerate() {
             let bit = if s < 1_100 {
@@ -186,6 +198,7 @@ fn main() {
     let prog = board.pio_load(PIO, &ir_program()).expect("load");
     let cfg = SmConfig {
         clkdiv: host::clkdiv(PIO_HZ),
+        // `wait pin` 看 in_pins 的第 0 个引脚，`jmp pin` 看 jmp_pin，两者都是接收头输出脚。
         in_pins: (pin, 1),
         jmp_pin: Some(pin),
         fifo_join: PIO_JOIN_NONE,
@@ -197,6 +210,7 @@ fn main() {
         .pio_sm_restart(PIO, SM, PIO_RESTART_CLKDIV | PIO_RESTART_FIFOS | PIO_RESTART_SM)
         .expect("restart");
 
+    // 稀疏模式：按键时才有数据，有数据才发。
     board
         .pio_stream_start(PIO, SM, true, 255)
         .expect("stream start");
@@ -221,6 +235,7 @@ fn main() {
         }
     }
 
+    // 收尾：停流、停状态机，读掉 FIFO 里的残留数据，引脚恢复为输入，释放指令内存。
     board.pio_stream_stop(PIO, SM).expect("stream stop");
     board.pio_sm_enable(PIO, SM, false).expect("disable");
     board.pio_rx_pop(PIO, SM, 255).expect("rx pop");

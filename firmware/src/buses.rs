@@ -1,3 +1,10 @@
+//! 打开 I2C / SPI / UART 硬件外设。
+//!
+//! embassy 的外设驱动要求编译期就确定用哪几个引脚（每个引脚是不同的类型），
+//! 而上位机是运行时传引脚号，所以这里把芯片支持的引脚组合逐一列出来匹配。
+//! 表中的组合来自 RP2040 数据手册的 GPIO 功能表，不在表里的组合返回 ST_BAD_PIN。
+//! 外设和引脚对象用 `steal()` 取得，由 main.rs 的 Role 仲裁保证同一时间只有一个使用者。
+
 use embassy_rp::i2c::{self, I2c};
 use embassy_rp::peripherals;
 use embassy_rp::spi::{self, Phase, Polarity, Spi};
@@ -10,6 +17,7 @@ pub type Spi0 = Spi<'static, peripherals::SPI0, spi::Blocking>;
 pub type Spi1 = Spi<'static, peripherals::SPI1, spi::Blocking>;
 pub type UartBus = Uart<'static, uart::Blocking>;
 
+/// I2C 公共配置：频率限制在 10 kHz..1 MHz，并打开芯片内部上拉。
 fn i2c_cfg(hz: u32) -> Result<i2c::Config, u8> {
     if !(10_000..=1_000_000).contains(&hz) { return Err(ST_BAD_ARG); }
     let mut config = i2c::Config::default();
@@ -19,6 +27,7 @@ fn i2c_cfg(hz: u32) -> Result<i2c::Config, u8> {
     Ok(config)
 }
 
+/// 打开 I2C0。注意 embassy 的参数顺序是 (SCL, SDA)。
 pub fn open_i2c0(sda: u8, scl: u8, hz: u32) -> Result<I2c0, u8> {
     let config = i2c_cfg(hz)?;
     match (sda, scl) {
@@ -34,6 +43,7 @@ pub fn open_i2c0(sda: u8, scl: u8, hz: u32) -> Result<I2c0, u8> {
     }
 }
 
+/// 打开 I2C1，参数顺序同上。
 pub fn open_i2c1(sda: u8, scl: u8, hz: u32) -> Result<I2c1, u8> {
     let config = i2c_cfg(hz)?;
     match (sda, scl) {
@@ -48,12 +58,15 @@ pub fn open_i2c1(sda: u8, scl: u8, hz: u32) -> Result<I2c1, u8> {
     }
 }
 
+/// 打开 SPI0（主机模式）。`mode` 是标准 SPI 模式 0..3：bit1 = CPOL（空闲电平），bit0 = CPHA（采样边沿）。
+/// 不接 MISO 时只发不收。
 pub fn open_spi0(sck: u8, mosi: u8, miso: Option<u8>, hz: u32, mode: u8) -> Result<Spi0, u8> {
     if mode > 3 || hz == 0 { return Err(ST_BAD_ARG); }
     let mut config = spi::Config::default();
     config.frequency = hz;
     config.polarity = if mode & 2 == 0 { Polarity::IdleLow } else { Polarity::IdleHigh };
     config.phase = if mode & 1 == 0 { Phase::CaptureOnFirstTransition } else { Phase::CaptureOnSecondTransition };
+    // 组合按 (SCK, MOSI, MISO) 列出。
     if let Some(miso) = miso {
         match (sck, mosi, miso) {
             (2, 3, 0) => Ok(Spi::new_blocking(unsafe { peripherals::SPI0::steal() }, unsafe { peripherals::PIN_2::steal() }, unsafe { peripherals::PIN_3::steal() }, unsafe { peripherals::PIN_0::steal() }, config)),
@@ -145,6 +158,7 @@ pub fn open_spi0(sck: u8, mosi: u8, miso: Option<u8>, hz: u32, mode: u8) -> Resu
     }
 }
 
+/// 打开 SPI1，参数含义同 `open_spi0`。
 pub fn open_spi1(sck: u8, mosi: u8, miso: Option<u8>, hz: u32, mode: u8) -> Result<Spi1, u8> {
     if mode > 3 || hz == 0 { return Err(ST_BAD_ARG); }
     let mut config = spi::Config::default();
@@ -207,6 +221,7 @@ pub fn open_spi1(sck: u8, mosi: u8, miso: Option<u8>, hz: u32, mode: u8) -> Resu
     }
 }
 
+/// 打开 UART0，8N1，波特率 300..3M。组合按 (TX, RX) 列出。
 pub fn open_uart0(tx: u8, rx: u8, baud: u32) -> Result<UartBus, u8> {
     if !(300..=3_000_000).contains(&baud) { return Err(ST_BAD_ARG); }
     let mut config = uart::Config::default();
@@ -232,6 +247,7 @@ pub fn open_uart0(tx: u8, rx: u8, baud: u32) -> Result<UartBus, u8> {
     }
 }
 
+/// 打开 UART1，参数含义同 `open_uart0`。
 pub fn open_uart1(tx: u8, rx: u8, baud: u32) -> Result<UartBus, u8> {
     if !(300..=3_000_000).contains(&baud) { return Err(ST_BAD_ARG); }
     let mut config = uart::Config::default();

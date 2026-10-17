@@ -1,3 +1,10 @@
+//! 上位机库：通过 USB 串口控制 pico-usb-io 固件。
+//!
+//! `Board` 封装了串口收发和帧协议，每个方法对应固件的一条命令，调用后等待应答再返回。
+//! 基础 IO（GPIO / PWM / ADC / I2C / SPI / UART）直接调用即可；
+//! 需要精确时序的功能用 `pio_*` 方法：自己写 PIO 程序（`pio::pio_asm!`）、装载、配置状态机、
+//! 收发数据。具体用法可参考 record.rs（I2S 录音）、ws2812.rs、servo.rs、ir.rs。
+
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,8 +29,10 @@ use io_proto::{
 };
 use serialport::SerialPort;
 
+/// 固件的系统时钟（embassy 默认配置），PIO 分频按它计算。
 pub const SYS_CLK_HZ: u32 = 125_000_000;
 
+/// `pio::pio_asm!` 汇编出来的程序类型（最多 32 条指令）。
 pub type Program = pio::Program<{ pio::RP2040_MAX_PROGRAM_SIZE }>;
 
 #[derive(Debug, thiserror::Error)]
@@ -32,10 +41,12 @@ pub enum Error {
     Serial(#[from] serialport::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// 固件应答里的错误码，见 protocol 里的 ST_* 常量。
     #[error("firmware status {0}")]
     Status(u8),
     #[error("response too short")]
     Short,
+    /// 规定时间内没收到应答（seq 为 0 表示等流数据超时）。
     #[error("timed out waiting for seq {0}")]
     Timeout(u16),
 }
@@ -47,31 +58,49 @@ pub struct Version {
     pub pins: u8,
 }
 
+/// 已装载到板子上的 PIO 程序。卸载、配置状态机时要用到。
 #[derive(Debug, Clone, Copy)]
 pub struct PioProgram {
+    /// 装在哪个 PIO 块（0 或 1）。
     pub pio: u8,
+    /// 实际装载起始地址。
     pub origin: u8,
+    /// 指令条数。
     pub count: u8,
+    // 程序的 side-set 设置，来自 `.side_set` 指令，配置状态机时自动带上。
     side_bits: u8,
     side_opt: bool,
     side_pindirs: bool,
 }
 
+/// 状态机配置，字段与固件 OP_PIO_SM_CONFIG 一一对应。引脚区间都写成 (起始引脚, 个数)。
 #[derive(Debug, Clone, Copy)]
 pub struct SmConfig {
+    /// 分频 (整数, 小数/256)，一般用 `clkdiv(目标频率)` 计算。
     pub clkdiv: (u16, u8),
+    /// `out pins` 写的引脚。
     pub out_pins: (u8, u8),
+    /// `set pins` 写的引脚（最多 5 个）。
     pub set_pins: (u8, u8),
+    /// `in pins` / `wait pin` 读的引脚。个数只用于固件的引脚占用登记。
     pub in_pins: (u8, u8),
+    /// side-set 的第一个引脚，个数由程序的 `.side_set` 决定。
     pub sideset_base: u8,
+    /// OUT 先移出低位（true）还是高位（false）。
     pub out_shift_right: bool,
+    /// IN 新数据从高位移入（true）还是低位（false）。
     pub in_shift_right: bool,
+    /// OSR 用完 `pull_thresh` 位后自动从 TX FIFO 取下一个字。
     pub autopull: bool,
+    /// ISR 攒够 `push_thresh` 位后自动推进 RX FIFO。
     pub autopush: bool,
     pub pull_thresh: u8,
     pub push_thresh: u8,
+    /// PIO_JOIN_NONE / PIO_JOIN_TX / PIO_JOIN_RX：单向使用时合并成 8 级 FIFO。
     pub fifo_join: u8,
+    /// `jmp pin` 判断的引脚。
     pub jmp_pin: Option<u8>,
+    /// 第 n 位为 1 表示 GPIO n 设为输出；只能包含上面用到的引脚。
     pub out_pindirs: u32,
 }
 
@@ -96,6 +125,7 @@ impl Default for SmConfig {
     }
 }
 
+/// 流状态。`dropped_words` 不为 0 说明板上缓冲满过、丢了数据（上位机读得太慢）。
 #[derive(Debug, Clone, Copy)]
 pub struct StreamStatus {
     pub active: bool,
@@ -103,12 +133,19 @@ pub struct StreamStatus {
     pub dropped_words: u32,
 }
 
+/// 计算让 PIO 跑在 `freq_hz` 的分频值，结果与固件 embassy 的 `calculate_pio_clock_divider` 相同。
+/// 例如 48 kHz I2S 需要 48000 × 128 Hz，得 (20, 88)。
 pub fn clkdiv(freq_hz: u32) -> (u16, u8) {
     let int = SYS_CLK_HZ / freq_hz;
     let frac = (((SYS_CLK_HZ % freq_hz) as u64) << 8) / freq_hz as u64;
     (int as u16, frac as u8)
 }
 
+/// 一块已连接的板子。
+///
+/// 串口由后台线程持续读取，读到的字节通过通道交给主线程解析。这样做是因为固件推流时
+/// 会源源不断地发数据：如果只在等应答时才读串口，Windows 的 USB 串口缓冲一满，
+/// 我们发出的命令也会被卡住，两边互相等待导致卡死。
 pub struct Board {
     port: Box<dyn SerialPort>,
     incoming: Receiver<Vec<u8>>,
@@ -116,10 +153,13 @@ pub struct Board {
     reader: Option<JoinHandle<()>>,
     parser: Parser,
     seq: u16,
+    /// 已收到但还没被 `read_stream` 取走的流数据。
     stream: VecDeque<Vec<u32>>,
 }
 
 impl Board {
+    /// 打开串口（Windows 上如 "COM5"，Linux 上如 "/dev/ttyACM0"）。
+    /// 打开时置 DTR，固件据此判断上位机已连接；关闭后 DTR 消失，固件会自动停掉 PIO。
     pub fn open(path: &str) -> Result<Self, Error> {
         let port = serialport::new(path, 115_200)
             .timeout(Duration::from_millis(30))
@@ -158,6 +198,7 @@ impl Board {
         })
     }
 
+    /// 主动关闭：停止后台读线程并关掉串口。Drop 时也会自动做同样的事。
     pub fn release(mut self) {
         self.shutdown();
     }
@@ -169,6 +210,7 @@ impl Board {
         }
     }
 
+    /// 查询协议版本、固件版本和引脚数，也可以用来确认连上的是不是这块板子。
     pub fn version(&mut self) -> Result<Version, Error> {
         let body = self.call(OP_VERSION, &[])?;
         if body.len() < 5 {
@@ -181,26 +223,32 @@ impl Board {
         })
     }
 
+    /// 把引脚设为输出并给定电平（会释放它原来的功能）。
     pub fn pin_output(&mut self, pin: u8, high: bool) -> Result<(), Error> {
         self.call(OP_PIN_CONFIG, &[pin, PIN_OUTPUT, PULL_NONE, u8::from(high)])?;
         Ok(())
     }
 
+    /// 把引脚设为无上下拉的输入。
     pub fn pin_input(&mut self, pin: u8) -> Result<(), Error> {
         self.call(OP_PIN_CONFIG, &[pin, PIN_INPUT, PULL_NONE, 0])?;
         Ok(())
     }
 
+    /// 写电平；引脚还不是 GPIO 时固件会自动切成输出。
     pub fn gpio_write(&mut self, pin: u8, high: bool) -> Result<(), Error> {
         self.call(OP_GPIO_WRITE, &[pin, u8::from(high)])?;
         Ok(())
     }
 
+    /// 读电平，不改变引脚当前功能。
     pub fn gpio_read(&mut self, pin: u8) -> Result<bool, Error> {
         let body = self.call(OP_GPIO_READ, &[pin])?;
         Ok(body.first().copied().unwrap_or(0) != 0)
     }
 
+    /// 硬件 PWM：频率 Hz，占空比为千分比（0..1000）。
+    /// 频率为 0 时把占空比清零，引脚已经在输出 PWM 时即变为恒低。
     pub fn pwm_set(&mut self, pin: u8, freq_hz: u32, duty_permille: u16) -> Result<(), Error> {
         let mut req = [0u8; 7];
         req[0] = pin;
@@ -210,11 +258,14 @@ impl Board {
         Ok(())
     }
 
+    /// 读 ADC（只支持 GP26..GP29），返回 12 位原始值，0..4095 对应 0..3.3 V。
     pub fn adc_read(&mut self, pin: u8) -> Result<u16, Error> {
         let body = self.call(OP_ADC_READ, &[pin])?;
         read_u16(&body, 0).ok_or(Error::Short)
     }
 
+    /// 打开 I2C 主机。SDA 必须是偶数脚、SCL = SDA + 1；总线号由引脚决定
+    /// （SDA % 4 == 0 是总线 0，== 2 是总线 1），之后 `i2c_transfer` 用这个总线号。
     pub fn i2c_config(&mut self, sda: u8, scl: u8, hz: u32) -> Result<(), Error> {
         let mut req = [0u8; 6];
         req[0] = sda;
@@ -224,6 +275,7 @@ impl Board {
         Ok(())
     }
 
+    /// I2C 先写 `write` 再读 `read_len` 字节（任一可为空），`addr` 是 7 位地址。
     pub fn i2c_transfer(&mut self, bus: u8, addr: u8, write: &[u8], read_len: usize) -> Result<Vec<u8>, Error> {
         let mut req = vec![bus, addr, 0, 0, 0, 0];
         req[2..4].copy_from_slice(&(write.len() as u16).to_le_bytes());
@@ -232,6 +284,8 @@ impl Board {
         self.call(OP_I2C_TRANSFER, &req)
     }
 
+    /// 打开 SPI 主机，`mode` 是标准 SPI 模式 0..3，`miso` 为 None 时只发不收。
+    /// 片选请自己用 `gpio_write` 控制。
     pub fn spi_config(&mut self, sck: u8, mosi: u8, miso: Option<u8>, hz: u32, mode: u8) -> Result<(), Error> {
         let mut req = [0u8; 8];
         req[0] = sck;
@@ -243,6 +297,7 @@ impl Board {
         Ok(())
     }
 
+    /// SPI 全双工收发，返回与发送等长的接收数据。
     pub fn spi_transfer(&mut self, bus: u8, data: &[u8]) -> Result<Vec<u8>, Error> {
         let mut req = Vec::with_capacity(1 + data.len());
         req.push(bus);
@@ -250,6 +305,7 @@ impl Board {
         self.call(OP_SPI_TRANSFER, &req)
     }
 
+    /// 打开 UART（8N1），UART 编号由 TX 引脚决定。
     pub fn uart_config(&mut self, tx: u8, rx: u8, baud: u32) -> Result<(), Error> {
         let mut req = [0u8; 6];
         req[0] = tx;
@@ -259,6 +315,7 @@ impl Board {
         Ok(())
     }
 
+    /// UART 发送。
     pub fn uart_write(&mut self, bus: u8, data: &[u8]) -> Result<(), Error> {
         let mut req = Vec::with_capacity(1 + data.len());
         req.push(bus);
@@ -267,6 +324,7 @@ impl Board {
         Ok(())
     }
 
+    /// UART 读取已收到的数据（不等待，可能为空）。硬件 FIFO 只有 32 字节，需要定期轮询。
     pub fn uart_read(&mut self, bus: u8, max: u16) -> Result<Vec<u8>, Error> {
         let mut req = [0u8; 3];
         req[0] = bus;
@@ -274,6 +332,8 @@ impl Board {
         self.call(OP_UART_READ, &req)
     }
 
+    /// 把 PIO 程序装到 PIO 块 `pio`（0 或 1）。程序里没写 `.origin` 时由固件自动选地址。
+    /// 每块共 32 条指令，用完记得 `pio_unload`。
     pub fn pio_load(&mut self, pio: u8, program: &Program) -> Result<PioProgram, Error> {
         let (flags, origin) = match program.origin {
             Some(origin) => (0, origin),
@@ -304,11 +364,14 @@ impl Board {
         })
     }
 
+    /// 卸载程序。还有状态机在运行这段程序时会返回 ST_BUSY，先 `pio_sm_enable(.., false)`。
     pub fn pio_unload(&mut self, prog: PioProgram) -> Result<(), Error> {
         self.call(OP_PIO_UNLOAD, &[prog.pio, prog.origin, prog.count])?;
         Ok(())
     }
 
+    /// 让 `prog` 所在 PIO 块的状态机 `sm`（0..3）运行这段程序，并按 `cfg` 配置。
+    /// 配置后状态机处于停用状态，需要 `pio_sm_enable` 才开始运行。
     pub fn pio_sm_config(&mut self, sm: u8, prog: &PioProgram, cfg: &SmConfig) -> Result<(), Error> {
         let mut flags = 0;
         for (on, bit) in [
@@ -323,6 +386,7 @@ impl Board {
                 flags |= bit;
             }
         }
+        // 按固件约定的 24 字节布局填写，第 19 字节保留为 0。
         let mut req = [0u8; PIO_SM_CONFIG_LEN];
         req[0] = prog.pio;
         req[1] = sm;
@@ -347,16 +411,22 @@ impl Board {
         Ok(())
     }
 
+    /// 使能 / 停用状态机。停用后引脚保持最后的电平。
     pub fn pio_sm_enable(&mut self, pio: u8, sm: u8, on: bool) -> Result<(), Error> {
         self.call(OP_PIO_SM_ENABLE, &[pio, sm, u8::from(on)])?;
         Ok(())
     }
 
+    /// 复位状态机，`flags` 用 PIO_RESTART_CLKDIV / PIO_RESTART_FIFOS / PIO_RESTART_SM 组合。
+    /// 一般在配置之后、使能之前三个都做一次，保证从干净的状态开始。
     pub fn pio_sm_restart(&mut self, pio: u8, sm: u8, flags: u8) -> Result<(), Error> {
         self.call(OP_PIO_SM_RESTART, &[pio, sm, flags])?;
         Ok(())
     }
 
+    /// 往状态机的 TX FIFO 写数据，自动按每帧 255 个字拆分。
+    /// FIFO 满时固件会等它腾出空间（每帧最多 50 ms）；一个字都写不进去时返回 ST_BUSY，
+    /// 通常说明状态机没在运行。
     pub fn pio_tx_push(&mut self, pio: u8, sm: u8, words: &[u32]) -> Result<(), Error> {
         let mut sent = 0;
         while sent < words.len() {
@@ -375,11 +445,16 @@ impl Board {
         Ok(())
     }
 
+    /// 一次性读取 RX FIFO 里现有的数据（最多 `max` 个字），适合偶尔读一下的场合；
+    /// 持续接收请用流。
     pub fn pio_rx_pop(&mut self, pio: u8, sm: u8, max: u8) -> Result<Vec<u32>, Error> {
         let body = self.call(OP_PIO_RX_POP, &[pio, sm, max])?;
         Ok(words(&body))
     }
 
+    /// 开始接收状态机的 RX 数据流，之后用 `read_stream` 取数据。
+    /// `sparse = false` 是连续模式（DMA，适合 I2S 等高速数据）；`true` 是稀疏模式（适合红外等偶发数据）。
+    /// `chunk_words` 是每帧最多带多少个字（0 表示 255）。请在 `pio_sm_enable` 之前调用。
     pub fn pio_stream_start(&mut self, pio: u8, sm: u8, sparse: bool, chunk_words: u8) -> Result<(), Error> {
         self.stream.clear();
         let flags = if sparse { PIO_STREAM_SPARSE } else { 0 };
@@ -387,12 +462,14 @@ impl Board {
         Ok(())
     }
 
+    /// 停止流（固件会同时停用该状态机），并丢掉还没读走的数据。
     pub fn pio_stream_stop(&mut self, pio: u8, sm: u8) -> Result<(), Error> {
         self.call(OP_PIO_STREAM_STOP, &[pio, sm])?;
         self.stream.clear();
         Ok(())
     }
 
+    /// 查询流状态，主要用来确认有没有丢数据。
     pub fn pio_stream_status(&mut self) -> Result<StreamStatus, Error> {
         let body = self.call(OP_PIO_STREAM_STATUS, &[])?;
         Ok(StreamStatus {
@@ -402,6 +479,7 @@ impl Board {
         })
     }
 
+    /// 取下一块流数据（一个事件帧的内容），最多等 `wait`，超时返回 `Error::Timeout(0)`。
     pub fn read_stream(&mut self, wait: Duration) -> Result<Vec<u32>, Error> {
         let deadline = Instant::now() + wait;
         loop {
@@ -425,6 +503,7 @@ impl Board {
         }
     }
 
+    /// 从后台读线程取一块原始字节；`wait` 内没有数据返回 None，读线程已退出返回错误。
     fn recv_chunk(&mut self, wait: Duration) -> Result<Option<Vec<u8>>, Error> {
         match self.incoming.recv_timeout(wait) {
             Ok(bytes) => Ok(Some(bytes)),
@@ -433,6 +512,8 @@ impl Board {
         }
     }
 
+    /// 发一条请求并等待对应 seq 的应答（最多 3 秒），返回应答 body。
+    /// 写串口和读数据交替进行，等待期间收到的流数据会放进队列，不会丢。
     fn call(&mut self, op: u16, body: &[u8]) -> Result<Vec<u8>, Error> {
         if body.len() > MAX_BODY {
             return Err(Error::Status(io_proto::ST_NO_SPACE));
@@ -491,6 +572,7 @@ impl Drop for Board {
     }
 }
 
+/// 把小端字节序列转成 u32 序列，末尾不足 4 字节的部分丢弃。
 fn words(bytes: &[u8]) -> Vec<u32> {
     bytes
         .chunks_exact(4)
