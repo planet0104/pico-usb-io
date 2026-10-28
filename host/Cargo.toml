@@ -48,3 +48,7 @@ path = "src/stepper.rs"
 [[bin]]
 name = "st7789"
 path = "src/st7789.rs"
+
+[[bin]]
+name = "gps"
+path = "src/gps.rs"
