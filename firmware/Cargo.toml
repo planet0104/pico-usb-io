@@ -14,10 +14,13 @@ embassy-rp = { version = "0.10", features = ["defmt", "time-driver", "critical-s
 embassy-usb = { version = "0.6", features = ["defmt"] }
 embassy-time = { version = "0.5", features = ["defmt"] }
 embassy-futures = "0.1"
+embassy-sync = "0.8"
 cortex-m = { version = "0.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"
 static_cell = "2"
 defmt = "1"
 defmt-rtt = "1"
 panic-probe = { version = "1", features = ["print-defmt"] }
+lz4_flex = { version = "0.14.0", default-features = false }
+tjpgdec-rs = { version = "0.4.0", default-features = false, features = ["fast-decode-2"] }
 

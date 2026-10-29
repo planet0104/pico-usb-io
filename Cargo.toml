@@ -3,5 +3,6 @@ members = ["protocol", "firmware", "host"]
 resolver = "2"
 
 [profile.release]
-opt-level = "s"
+# 按速度优化：固件要在 RP2040 上解 JPEG、解 LZ4，2 MB 闪存放得下
+opt-level = 3
 lto = true

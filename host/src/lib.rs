@@ -11,14 +11,16 @@ use std::time::{Duration, Instant};
 
 pub use io_proto::{
     PIO_JOIN_NONE, PIO_JOIN_RX, PIO_JOIN_TX, PIO_RESTART_CLKDIV, PIO_RESTART_FIFOS, PIO_RESTART_SM,
+    PROTO_VERSION,
 };
 use io_proto::{
     read_u16, read_u32, Frame, Parser, KIND_EVENT, KIND_REQ, KIND_RESP, MAX_BODY, MAX_FRAME,
     OP_ADC_READ, OP_GPIO_READ, OP_GPIO_WRITE, OP_I2C_CONFIG, OP_I2C_TRANSFER, OP_PIN_CONFIG,
     OP_PIO_LOAD, OP_PIO_RX_POP, OP_PIO_SM_CONFIG, OP_PIO_SM_ENABLE, OP_PIO_SM_RESTART,
     OP_PIO_STREAM_EVENT, OP_PIO_STREAM_START, OP_PIO_STREAM_STATUS, OP_PIO_STREAM_STOP,
-    OP_PIO_TX_PUSH, OP_PIO_UNLOAD, OP_PWM_SET, OP_SPI_CONFIG, OP_SPI_TRANSFER, OP_UART_CONFIG,
-    OP_UART_READ, OP_UART_WRITE, OP_VERSION, PIN_INPUT, PIN_OUTPUT, PIO_AUTOPULL, PIO_AUTOPUSH,
+    OP_PIO_TX_PUSH, OP_PIO_UNLOAD, OP_PWM_SET, OP_SPI_CONFIG, OP_SPI_TRANSFER, OP_SPI_WRITE,
+    OP_SPI_WRITE_LZ4, OP_JPEG, JPEG_CORE1, JPEG_FIRST, JPEG_LAST, JPEG_MAX, SPI_LZ4_MAX,
+    OP_UART_CONFIG, OP_UART_READ, OP_UART_WRITE, OP_VERSION, PIN_INPUT, PIN_OUTPUT, PIO_AUTOPULL, PIO_AUTOPUSH,
     PIO_IN_SHIFT_RIGHT, PIO_LOAD_AUTO, PIO_NO_PIN, PIO_OUT_SHIFT_RIGHT, PIO_SIDESET_OPT,
     PIO_SIDESET_PINDIRS, PIO_SM_CONFIG_LEN, PIO_STREAM_SPARSE, PIO_TX_WAIT, PULL_NONE,
     SPI_MISO_NONE, ST_BUSY, ST_OK,
@@ -139,6 +141,8 @@ pub fn clkdiv(freq_hz: u32) -> (u16, u8) {
 
 /// 串口单次读 / 写的超时。读到数据会立即返回，这个值只决定"没数据时最多等多久"。
 const IO_TIMEOUT: Duration = Duration::from_millis(5);
+/// 大块数据（刷屏）不等每帧应答就接着发，最多这么多帧在路上：固件的命令队列只有 4 格，满了会丢。
+const IN_FLIGHT: usize = 3;
 
 /// 一块已连接的板子。
 ///
@@ -152,6 +156,8 @@ pub struct Board {
     seq: u16,
     /// 已收到但还没被 `read_stream` 取走的流数据。
     stream: VecDeque<Vec<u32>>,
+    /// 已收到但还没被取走的应答 (seq, status, body)。流水线发送时几条应答可能一起到。
+    replies: VecDeque<(u16, u8, Vec<u8>)>,
 }
 
 impl Board {
@@ -167,6 +173,7 @@ impl Board {
             parser: Parser::new(),
             seq: 1,
             stream: VecDeque::new(),
+            replies: VecDeque::new(),
         })
     }
 
@@ -266,6 +273,113 @@ impl Board {
         req.push(bus);
         req.extend_from_slice(data);
         self.call(OP_SPI_TRANSFER, &req)
+    }
+
+    /// SPI 只发不收（刷屏等大块数据）。超过一帧的数据自动拆成多帧，不等每帧的应答就接着发，
+    /// 最多 IN_FLIGHT 帧在路上。需要协议版本 3。
+    pub fn spi_write(&mut self, bus: u8, data: &[u8]) -> Result<(), Error> {
+        let mut pending = VecDeque::new();
+        for part in data.chunks(MAX_BODY - 1) {
+            if pending.len() == IN_FLIGHT {
+                self.wait(pending.pop_front().expect("pending"))?;
+            }
+            let mut req = Vec::with_capacity(1 + part.len());
+            req.push(bus);
+            req.extend_from_slice(part);
+            pending.push_back(self.send(OP_SPI_WRITE, &req)?);
+        }
+        for seq in pending {
+            self.wait(seq)?;
+        }
+        Ok(())
+    }
+
+    /// 同 `spi_write`，但先用 LZ4 压缩，固件解压后再发：数据先按 SPI_LZ4_MAX 一块压，
+    /// 压完放不进一帧就把块减半再压。需要协议版本 4。
+    pub fn spi_write_lz4(&mut self, bus: u8, data: &[u8]) -> Result<(), Error> {
+        let mut pending = VecDeque::new();
+        let mut rest = data;
+        while !rest.is_empty() {
+            let mut take = rest.len().min(SPI_LZ4_MAX);
+            let packed = loop {
+                let packed = lz4_flex::block::compress(&rest[..take]);
+                if packed.len() < MAX_BODY || take == 1 {
+                    break packed;
+                }
+                take /= 2;
+            };
+            rest = &rest[take..];
+            if pending.len() == IN_FLIGHT {
+                self.wait(pending.pop_front().expect("pending"))?;
+            }
+            let mut req = Vec::with_capacity(1 + packed.len());
+            req.push(bus);
+            req.extend_from_slice(&packed);
+            pending.push_back(self.send(OP_SPI_WRITE_LZ4, &req)?);
+        }
+        for seq in pending {
+            self.wait(seq)?;
+        }
+        Ok(())
+    }
+
+    /// 让固件解码一张基线 JPEG 并画到屏上（ST7789 一类的屏），左上角放在 (x, y)。
+    /// `dc` 是屏的数据/命令选择脚，要先用 `pin_output` 设成输出。返回固件解码显示用的时间。
+    /// `second_core` 为 true 时交给 RP2040 的第二个核解码，收齐就返回，返回的是第二个核上一张的用时；
+    /// 把一屏切成两张图，一张给第二个核、一张不给，两个核就同时解码。需要协议版本 5。
+    pub fn jpeg_show(
+        &mut self,
+        bus: u8,
+        dc: u8,
+        x: u16,
+        y: u16,
+        jpeg: &[u8],
+        second_core: bool,
+    ) -> Result<Duration, Error> {
+        if jpeg.len() > JPEG_MAX {
+            return Err(Error::Status(io_proto::ST_NO_SPACE));
+        }
+        let mut head = vec![bus, dc];
+        head.extend_from_slice(&x.to_le_bytes());
+        head.extend_from_slice(&y.to_le_bytes());
+        let mut pending = VecDeque::new();
+        let mut rest = jpeg;
+        let mut first = true;
+        loop {
+            let room = MAX_BODY - 1 - if first { head.len() } else { 0 };
+            let take = rest.len().min(room);
+            let last = take == rest.len();
+            let mut flags = 0;
+            if first {
+                flags |= JPEG_FIRST;
+                if second_core {
+                    flags |= JPEG_CORE1;
+                }
+            }
+            if last {
+                flags |= JPEG_LAST;
+            }
+            let mut req = vec![flags];
+            if first {
+                req.extend_from_slice(&head);
+            }
+            req.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            first = false;
+            if pending.len() == IN_FLIGHT {
+                self.wait(pending.pop_front().expect("pending"))?;
+            }
+            pending.push_back(self.send(OP_JPEG, &req)?);
+            if last {
+                break;
+            }
+        }
+        let mut reply = Vec::new();
+        for seq in pending {
+            reply = self.wait(seq)?;
+        }
+        let us = reply.get(..4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+        Ok(Duration::from_micros(u64::from(us)))
     }
 
     /// 打开 UART（8N1），UART 编号由 TX 引脚决定。
@@ -454,7 +568,7 @@ impl Board {
                 return Err(Error::Timeout(0));
             }
             if let Some(got) = self.recv_chunk(left)? {
-                self.absorb(&got, 0);
+                self.absorb(&got);
             }
         }
     }
@@ -476,24 +590,52 @@ impl Board {
         }
     }
 
-    /// 解析收到的字节：流数据放进队列；遇到序号为 `seq` 的应答就返回 (status, body)。
-    fn absorb(&mut self, bytes: &[u8], seq: u16) -> Option<(u8, Vec<u8>)> {
-        let mut found = None;
+    /// 解析收到的字节：流数据和应答分别放进各自的队列。
+    fn absorb(&mut self, bytes: &[u8]) {
         let mut chunks = Vec::new();
+        let mut replies = Vec::new();
         self.parser.push(bytes, |frame| {
             if frame.kind == KIND_EVENT && frame.op == OP_PIO_STREAM_EVENT && !frame.body.is_empty() {
                 chunks.push(words(frame.body));
-            } else if frame.kind == KIND_RESP && frame.seq == seq {
-                found = Some((frame.status, frame.body.to_vec()));
+            } else if frame.kind == KIND_RESP {
+                replies.push((frame.seq, frame.status, frame.body.to_vec()));
             }
         });
         self.stream.extend(chunks);
-        found
+        self.replies.extend(replies);
     }
 
     /// 发一条请求并等待对应 seq 的应答（最多 3 秒），返回应答 body。
     /// 等待期间收到的流数据会放进队列，不会丢。
     fn call(&mut self, op: u16, body: &[u8]) -> Result<Vec<u8>, Error> {
+        let seq = self.send(op, body)?;
+        self.wait(seq)
+    }
+
+    /// 等序号为 `seq` 的应答（最多 3 秒）。比它早的应答都是没人要了的（之前超时放弃的请求），一并丢掉。
+    fn wait(&mut self, seq: u16) -> Result<Vec<u8>, Error> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            while let Some((got, status, body)) = self.replies.pop_front() {
+                if got != seq {
+                    continue;
+                }
+                if status != ST_OK {
+                    return Err(Error::Status(status));
+                }
+                return Ok(body);
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Timeout(seq));
+            }
+            if let Some(got) = self.recv_chunk(Duration::from_millis(20))? {
+                self.absorb(&got);
+            }
+        }
+    }
+
+    /// 只发请求不等应答，返回它的序号。
+    fn send(&mut self, op: u16, body: &[u8]) -> Result<u16, Error> {
         if body.len() > MAX_BODY {
             return Err(Error::Status(io_proto::ST_NO_SPACE));
         }
@@ -523,24 +665,13 @@ impl Board {
                 if Instant::now() >= deadline {
                     return Err(Error::Timeout(seq));
                 }
-                // 板子暂时收不下（例如正在做耗时的 I2C），顺便把已到的流数据读走。
+                // 板子暂时收不下（例如正在做耗时的 I2C），顺便把已到的流数据和应答读走。
                 if let Some(got) = self.recv_chunk(Duration::ZERO)? {
-                    self.absorb(&got, 0);
+                    self.absorb(&got);
                 }
             }
         }
-        while Instant::now() < deadline {
-            let Some(got) = self.recv_chunk(Duration::from_millis(20))? else {
-                continue;
-            };
-            if let Some((status, body)) = self.absorb(&got, seq) {
-                if status != ST_OK {
-                    return Err(Error::Status(status));
-                }
-                return Ok(body);
-            }
-        }
-        Err(Error::Timeout(seq))
+        Ok(seq)
     }
 }
 

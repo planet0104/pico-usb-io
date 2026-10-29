@@ -5,9 +5,15 @@ edition = "2021"
 
 [dependencies]
 io-proto = { path = "../protocol" }
+lz4_flex = "0.14"
 pio = "0.3"
 serialport = { version = "4", default-features = false }
 thiserror = "2"
+
+# 只给 examples/camera.rs（电脑摄像头预览测速）用，不影响依赖 host 库的程序
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+nokhwa = { version = "0.10", default-features = false, features = ["input-native"] }
 
 [[bin]]
 name = "blink"

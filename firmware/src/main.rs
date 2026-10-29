@@ -15,14 +15,19 @@
 mod buses;
 mod pins;
 mod pio;
+mod screen;
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{select, Either};
 use embassy_rp::adc::{Adc, Channel};
 use embassy_rp::bind_interrupts;
+use embassy_rp::clocks::ClockConfig;
 use embassy_rp::gpio::Pull;
+use embassy_rp::multicore::{spawn_core1, Stack};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterrupt};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State};
 use embassy_usb::driver::EndpointError;
@@ -32,15 +37,21 @@ use io_proto::{
     OP_ADC_READ, OP_GPIO_READ, OP_GPIO_WRITE, OP_I2C_CONFIG, OP_I2C_TRANSFER, OP_PIN_CONFIG,
     OP_PIO_LOAD, OP_PIO_RX_POP, OP_PIO_SM_CONFIG, OP_PIO_SM_ENABLE, OP_PIO_SM_RESTART,
     OP_PIO_STREAM_EVENT, OP_PIO_STREAM_START, OP_PIO_STREAM_STATUS, OP_PIO_STREAM_STOP,
-    OP_PIO_TX_PUSH, OP_PIO_UNLOAD, OP_PWM_SET, OP_SPI_CONFIG, OP_SPI_TRANSFER, OP_UART_CONFIG,
+    OP_JPEG, OP_PIO_TX_PUSH, OP_PIO_UNLOAD, OP_PWM_SET, OP_SPI_CONFIG, OP_SPI_TRANSFER, OP_SPI_WRITE,
+    OP_SPI_WRITE_LZ4, OP_UART_CONFIG,
     OP_UART_READ, OP_UART_WRITE, OP_VERSION, PIN_COUNT, PIN_HIZ, PIN_INPUT, PIN_OUTPUT,
     PROTO_VERSION, PULL_DOWN, PULL_UP, SPI_MISO_NONE, ST_BAD_ARG, ST_BAD_PIN, ST_IO, ST_OK,
 };
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
-/// 固件版本，OP_VERSION 应答里返回；2 表示通用 PIO 引擎版本。
-const FIRMWARE_VERSION: u16 = 2;
+/// 固件版本，OP_VERSION 应答里返回；2 表示通用 PIO 引擎版本，3 加了 OP_SPI_WRITE 和 4 KB 帧，
+/// 4 丢弃上位机发到一半就断掉的帧，5 收到命令立刻处理（不再等 1 ms 轮询），
+/// 6 CRC 查表、整块解析、OP_SPI_WRITE 走 DMA，7 加 OP_SPI_WRITE_LZ4 和 OP_JPEG，
+/// 8 JPEG 可以交给第二个核解码。
+const FIRMWARE_VERSION: u16 = 8;
+/// 一帧的各个 USB 包是连续发来的，中间隔这么久还没收齐就当作发送方已经没了。
+const PARTIAL_FRAME_TIMEOUT: Duration = Duration::from_millis(200);
 
 // 中断绑定：USB 控制器中断交给 embassy 的 USB 驱动，DMA_IRQ_0 交给 PIO 流引擎。
 bind_interrupts!(struct Irqs {
@@ -50,7 +61,13 @@ bind_interrupts!(struct Irqs {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let p = embassy_rp::init(Default::default());
+    // 200 MHz（核心电压自动升到 1.15 V，数据手册给出的超频档）：USB 每个 64 字节包都要 CPU 处理一次，
+    // 刷屏这种大块数据的接收速度跟着主频走。
+    let clocks = ClockConfig::system_freq(200_000_000).expect("200 MHz");
+    let p = embassy_rp::init(embassy_rp::config::Config::new(clocks));
+    // 第二个核只解 JPEG（JPEG_CORE1），见 screen.rs。
+    static mut CORE1_STACK: Stack<8192> = Stack::new();
+    spawn_core1(p.CORE1, unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) }, || screen::core1_main());
     let adc = Adc::new_blocking(p.ADC, Default::default());
     let mut board = Board::new(adc);
 
@@ -128,8 +145,8 @@ async fn main(spawner: Spawner) {
                 }
                 continue;
             }
-            // 什么都没有就让出 1 ms，给其他任务运行。
-            Timer::after(Duration::from_millis(1)).await;
+            // 什么都没有就等新命令，最多 1 ms 再回来看有没有流数据要推。
+            select(CMD_READY.wait(), Timer::after(Duration::from_millis(1))).await;
         }
     }
 }
@@ -142,7 +159,21 @@ async fn usb_reader(mut rx: Receiver<'static, MyUsbDriver>) -> ! {
         let mut parser = Parser::new();
         let mut packet = [0u8; 64];
         loop {
-            match rx.read_packet(&mut packet).await {
+            // 收了半帧后一段时间没有后续数据，说明上位机发到一半就没了（比如上位机所在的开发板卡死重启，
+            // Pico 没跟着断电）。丢掉这半帧，不然后面的请求都会被当成它的剩余部分吞掉，最多要吞 4 KB 才能重新同步。
+            let read = if parser.is_idle() {
+                Either::First(rx.read_packet(&mut packet).await)
+            } else {
+                select(rx.read_packet(&mut packet), Timer::after(PARTIAL_FRAME_TIMEOUT)).await
+            };
+            let read = match read {
+                Either::First(read) => read,
+                Either::Second(_) => {
+                    parser.reset();
+                    continue;
+                }
+            };
+            match read {
                 Ok(n) => {
                     if parser.is_idle() && is_bootsel_text(&packet[..n]) {
                         embassy_rp::rom_data::reset_to_usb_boot(0, 0);
@@ -184,21 +215,9 @@ impl OwnedFrame {
         body: [0; MAX_BODY],
         body_len: 0,
     };
-
-    fn from_frame(frame: &Frame<'_>) -> Self {
-        let mut body = [0u8; MAX_BODY];
-        let n = frame.body.len().min(MAX_BODY);
-        body[..n].copy_from_slice(&frame.body[..n]);
-        Self {
-            seq: frame.seq,
-            op: frame.op,
-            body,
-            body_len: n,
-        }
-    }
 }
 
-/// 应答 / 事件 body 的公用缓冲区。放在 static 里而不是栈上，避免 1 KB 数组撑爆任务栈；
+/// 应答 / 事件 body 的公用缓冲区。放在 static 里而不是栈上，避免 4 KB 数组撑爆任务栈；
 /// 只有主循环使用，同一时间只有一处在用。
 fn resp_body() -> &'static mut [u8; MAX_BODY] {
     static mut BODY: [u8; MAX_BODY] = [0; MAX_BODY];
@@ -223,6 +242,9 @@ fn cmd_q() -> *mut CmdQ {
     core::ptr::addr_of_mut!(Q)
 }
 
+/// 主循环空闲时等这个信号，有新命令立刻醒来，不用等到下一次 1 ms 轮询。
+static CMD_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
 /// 放入一条命令；队列满时丢弃，上位机会因为收不到应答而超时。
 fn push_cmd(frame: &Frame) {
     cortex_m::interrupt::free(|_| unsafe {
@@ -230,10 +252,17 @@ fn push_cmd(frame: &Frame) {
         if q.len >= q.buf.len() {
             return;
         }
-        q.buf[q.tail] = OwnedFrame::from_frame(frame);
+        // 直接写进队列的格子，不经过栈上的临时副本。
+        let slot = &mut q.buf[q.tail];
+        let n = frame.body.len().min(MAX_BODY);
+        slot.seq = frame.seq;
+        slot.op = frame.op;
+        slot.body[..n].copy_from_slice(&frame.body[..n]);
+        slot.body_len = n;
         q.tail = (q.tail + 1) % q.buf.len();
         q.len += 1;
     });
+    CMD_READY.signal(());
 }
 
 fn pop_cmd() -> Option<OwnedFrame> {
@@ -370,6 +399,8 @@ struct Board {
     i2c1: Option<buses::I2c1>,
     spi0: Option<buses::Spi0>,
     spi1: Option<buses::Spi1>,
+    /// 用 DMA 往 SPI 屏写数据（OP_SPI_WRITE / OP_SPI_WRITE_LZ4 / OP_JPEG）。
+    screen: screen::Screen,
     uart0: Option<buses::UartBus>,
     uart1: Option<buses::UartBus>,
     /// 每条总线当前用的引脚，释放总线时一起把这些引脚设为高阻。
@@ -388,6 +419,7 @@ impl Board {
             i2c1: None,
             spi0: None,
             spi1: None,
+            screen: screen::Screen::new(),
             uart0: None,
             uart1: None,
             i2c_pins: [[None; 2]; 2],
@@ -466,6 +498,11 @@ impl Board {
 
     /// 执行一条命令，返回 (status, 应答 body 长度)。
     async fn handle(&mut self, op: u16, req: &[u8], out: &mut [u8]) -> (u8, usize) {
+        // 上一条写屏数据可能还在 DMA 发送、第二个核可能还在画 JPEG：其他命令（尤其是切换屏幕 DC 脚）
+        // 都要等它们完成再执行。OP_JPEG 自己会排队用 SPI。
+        if op != OP_JPEG {
+            self.screen.finish();
+        }
         match self.dispatch(op, req, out).await {
             Ok(n) => (ST_OK, n),
             Err(status) => (status, 0),
@@ -491,6 +528,9 @@ impl Board {
             OP_I2C_TRANSFER => self.i2c_transfer(req, out),
             OP_SPI_CONFIG => self.spi_config(req),
             OP_SPI_TRANSFER => self.spi_transfer(req, out),
+            OP_SPI_WRITE => self.spi_write(req, false),
+            OP_SPI_WRITE_LZ4 => self.spi_write(req, true),
+            OP_JPEG => self.jpeg(req, out),
             OP_UART_CONFIG => self.uart_config(req),
             OP_UART_WRITE => self.uart_write(req),
             OP_UART_READ => self.uart_read(req, out),
@@ -720,6 +760,42 @@ impl Board {
             return Err(ST_BAD_ARG);
         }
         Ok(data.len())
+    }
+
+    /// OP_SPI_WRITE / OP_SPI_WRITE_LZ4：body = [bus, 数据...]，只发不收，应答没有 body。
+    /// 交给 DMA 发送，不等发完就回应答（见 screen.rs）。
+    fn spi_write(&mut self, req: &[u8], lz4: bool) -> Result<usize, u8> {
+        let bus = *req.first().ok_or(ST_BAD_ARG)?;
+        let data = req.get(1..).ok_or(ST_BAD_ARG)?;
+        if data.is_empty() || !self.spi_open(bus) {
+            return Err(ST_BAD_ARG);
+        }
+        let bus = screen::Bus::new(bus)?;
+        if lz4 {
+            self.screen.write_lz4(bus, data)
+        } else {
+            self.screen.write(bus, data)
+        }
+    }
+
+    fn spi_open(&self, bus: u8) -> bool {
+        match bus {
+            0 => self.spi0.is_some(),
+            1 => self.spi1.is_some(),
+            _ => false,
+        }
+    }
+
+    /// OP_JPEG：见 protocol 里的说明和 screen.rs。
+    fn jpeg(&mut self, req: &[u8], out: &mut [u8]) -> Result<usize, u8> {
+        let (spi0, spi1) = (self.spi0.is_some(), self.spi1.is_some());
+        let role = self.role;
+        self.screen.jpeg(
+            req,
+            out,
+            |bus| matches!((bus, spi0, spi1), (0, true, _) | (1, _, true)),
+            |dc| pins::valid(dc) && role[dc as usize] == Role::Gpio,
+        )
     }
 
     /// OP_UART_CONFIG：body = [TX, RX, 波特率 u32]。

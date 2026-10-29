@@ -15,12 +15,14 @@
 /// 帧起始标志的两个字节。
 pub const SOF0: u8 = 0xA5;
 pub const SOF1: u8 = 0x5A;
-/// 协议版本。删除旧的 I2S / pulse / bitstream 专用命令后升为 2。
-pub const PROTO_VERSION: u16 = 2;
+/// 协议版本。删除旧的 I2S / pulse / bitstream 专用命令后升为 2；
+/// 加 OP_SPI_WRITE、body 上限从 1 KB 提到 4 KB 后升为 3；加 OP_SPI_WRITE_LZ4、OP_JPEG 后升为 4；
+/// 加 JPEG_CORE1 后升为 5。
+pub const PROTO_VERSION: u16 = 5;
 /// RP2040 可用的 GPIO 数量（GP0..GP29）。
 pub const PIN_COUNT: u8 = 30;
-/// 单帧 body 的最大字节数。
-pub const MAX_BODY: usize = 1024;
+/// 单帧 body 的最大字节数。刷屏这种大块数据每帧要等一次应答，帧越大往返越少。
+pub const MAX_BODY: usize = 4096;
 /// kind + seq + op + status + len 共 8 字节。
 pub const HEADER_LEN: usize = 8;
 /// 一帧的最大总长度：SOF(2) + 头(8) + body + CRC(2)。
@@ -47,6 +49,26 @@ pub const OP_SPI_TRANSFER: u16 = 10;
 pub const OP_UART_CONFIG: u16 = 11;
 pub const OP_UART_WRITE: u16 = 12;
 pub const OP_UART_READ: u16 = 13;
+/// 只发不收的 SPI 写：body = [bus, 数据...]，应答没有 body。
+/// 刷屏用它代替 OP_SPI_TRANSFER，USB 上不用再把读回的同样多字节传回来。
+pub const OP_SPI_WRITE: u16 = 14;
+/// 同 OP_SPI_WRITE，但数据是一个 LZ4 块（lz4_flex 的 block 格式，不带长度前缀）：
+/// body = [bus, 压缩数据...]，固件解压后再发，解压后最多 SPI_LZ4_MAX 字节。
+pub const OP_SPI_WRITE_LZ4: u16 = 15;
+/// 一个 LZ4 块解压后的最大字节数。
+pub const SPI_LZ4_MAX: usize = 16 * 1024;
+/// 把一张基线 JPEG 解码后画到 ST7789 这类"设窗口 + 写显存"的屏上。一张图分几帧发：
+/// body = [flags, 数据...]；第一帧（JPEG_FIRST）的数据前面多 6 字节 [bus, DC 脚, x u16, y u16]，
+/// 是总线、屏的数据/命令选择脚和图片左上角在屏上的位置；最后一帧（JPEG_LAST）收齐后解码显示，
+/// 应答 [解码显示用时 u32 微秒]。DC 脚要先用 OP_GPIO_WRITE 设成输出。
+/// 第一帧带 JPEG_CORE1 时交给第二个核解码：收齐就应答，不等画完，应答里是第二个核上一张的用时。
+/// 这样把一屏切成两张图、一张带 JPEG_CORE1 一张不带，两个核同时解码。
+pub const OP_JPEG: u16 = 16;
+pub const JPEG_FIRST: u8 = 1 << 0;
+pub const JPEG_LAST: u8 = 1 << 1;
+pub const JPEG_CORE1: u8 = 1 << 2;
+/// 一张 JPEG 最大字节数（240×240 质量 95 约 21 KB）。两个核各要一块接收缓冲区，内存不够再大了。
+pub const JPEG_MAX: usize = 24 * 1024;
 
 // 通用 PIO 原语操作码，body 布局见 pio-refactor.md 第 4 节。
 /// 把 PIO 指令字装进指令内存。
@@ -183,14 +205,22 @@ impl Parser {
         self.len == 0
     }
 
-    /// 喂入一段收到的字节，每解出一帧调用一次 `on_frame`。
-    pub fn push(&mut self, data: &[u8], mut on_frame: impl for<'a> FnMut(Frame<'a>)) {
-        for &b in data {
+    /// 丢掉收了一半的帧。
+    pub fn reset(&mut self) {
+        self.len = 0;
+    }
+
+    /// 喂入一段收到的字节，每解出一帧调用一次 `on_frame`。整段一次拷进缓冲区再找帧，
+    /// 固件收 USB 时不用每个字节都检查一遍。
+    pub fn push(&mut self, mut data: &[u8], mut on_frame: impl for<'a> FnMut(Frame<'a>)) {
+        while !data.is_empty() {
             if self.len >= MAX_FRAME {
                 self.shift_sof();
             }
-            self.buf[self.len] = b;
-            self.len += 1;
+            let n = data.len().min(MAX_FRAME - self.len);
+            self.buf[self.len..self.len + n].copy_from_slice(&data[..n]);
+            self.len += n;
+            data = &data[n..];
             self.align_sof();
             while self.try_one(&mut on_frame) {}
         }
@@ -244,22 +274,16 @@ impl Parser {
         let expect = u16::from_le_bytes([self.buf[total - 2], self.buf[total - 1]]);
         let actual = crc16(&self.buf[2..total - 2]);
         if expect == actual {
-            let kind = self.buf[2];
-            let seq = u16::from_le_bytes([self.buf[3], self.buf[4]]);
-            let op = u16::from_le_bytes([self.buf[5], self.buf[6]]);
-            let status = self.buf[7];
-            // 先把 body 复制出来，再把剩余数据前移，回调里拿到的 body 才不会被覆盖。
-            let mut body = [0u8; MAX_BODY];
-            body[..body_len].copy_from_slice(&self.buf[10..10 + body_len]);
+            // 先回调（body 直接借用缓冲区），再把剩余数据前移。
+            on_frame(Frame {
+                kind: self.buf[2],
+                seq: u16::from_le_bytes([self.buf[3], self.buf[4]]),
+                op: u16::from_le_bytes([self.buf[5], self.buf[6]]),
+                status: self.buf[7],
+                body: &self.buf[10..10 + body_len],
+            });
             self.buf.copy_within(total..self.len, 0);
             self.len -= total;
-            on_frame(Frame {
-                kind,
-                seq,
-                op,
-                status,
-                body: &body[..body_len],
-            });
             true
         } else {
             self.shift_sof();
@@ -274,21 +298,31 @@ impl Default for Parser {
     }
 }
 
-/// CRC-16/MODBUS（多项式 0xA001 反射，初值 0xFFFF）。
+/// CRC-16/MODBUS（多项式 0xA001 反射，初值 0xFFFF）。按字节查表：固件的 Cortex-M0+ 上
+/// 逐位算一个 4 KB 的帧要 1 ms 以上，刷屏时每帧都要算。
 pub fn crc16(data: &[u8]) -> u16 {
     let mut crc: u16 = 0xFFFF;
     for &b in data {
-        crc ^= b as u16;
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0xA001;
-            } else {
-                crc >>= 1;
-            }
-        }
+        crc = (crc >> 8) ^ CRC_TABLE[((crc ^ b as u16) & 0xFF) as usize];
     }
     crc
 }
+
+const CRC_TABLE: [u16; 256] = {
+    let mut table = [0u16; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u16;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xA001 } else { crc >> 1 };
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
 
 /// 从 body 的 `at` 位置读小端 u16，越界返回 None。
 pub fn read_u16(body: &[u8], at: usize) -> Option<u16> {
@@ -338,5 +372,33 @@ mod tests {
             got = true;
         });
         assert!(got);
+    }
+
+    #[test]
+    fn crc16_modbus_check_value() {
+        assert_eq!(crc16(b"123456789"), 0x4B37);
+    }
+
+    /// 两帧挤在同一块数据里、又被切成大小不一的块喂进来，都能解出来。
+    #[test]
+    fn frames_split_across_chunks() {
+        let mut raw = [0u8; 2 * MAX_FRAME];
+        let big = [7u8; MAX_BODY];
+        let mut n = 0;
+        for (seq, body) in [(1u16, &big[..]), (2, &[9u8, 8][..])] {
+            let frame = Frame { kind: KIND_REQ, seq, op: OP_SPI_WRITE, status: 0, body };
+            n += encode(frame, &mut raw[n..]).unwrap();
+        }
+        let mut p = Parser::new();
+        let mut seqs = [0u16; 2];
+        let mut count = 0;
+        for chunk in raw[..n].chunks(37) {
+            p.push(chunk, |f| {
+                seqs[count] = f.seq;
+                assert_eq!(f.body.len(), if f.seq == 1 { MAX_BODY } else { 2 });
+                count += 1;
+            });
+        }
+        assert_eq!((count, seqs), (2, [1, 2]));
     }
 }

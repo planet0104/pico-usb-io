@@ -24,8 +24,8 @@ const H: usize = 240;
 const SPI_HZ: u32 = 24_000_000;
 /// SPI 模式 3：时钟空闲为高，第二个边沿采样。
 const SPI_MODE: u8 = 3;
-/// 单次 SPI 传输最多带多少数据字节：协议 body 上限 1024，扣掉 1 字节总线号。
-const CHUNK: usize = 1000;
+/// `spi_write` 每帧带的数据字节：协议 body 上限 4096，扣掉 1 字节总线号。
+const CHUNK: usize = 4095;
 /// 弹球方块边长（像素）和每帧移动距离
 const BOX: i32 = 32;
 const SPEED: i32 = 3;
@@ -59,12 +59,9 @@ impl Panel {
         Ok(())
     }
 
-    /// 发像素数据：DC 已经拉高，分块送完（每块 ≤ CHUNK 字节）。
+    /// 发像素数据：DC 已经拉高，只发不收，`spi_write` 自动分块。
     fn push(&self, board: &mut Board, data: &[u8]) -> Result<(), Error> {
-        for part in data.chunks(CHUNK) {
-            board.spi_transfer(self.bus, part)?;
-        }
-        Ok(())
+        board.spi_write(self.bus, data)
     }
 
     /// 设置写窗口（CASET 列 / RASET 行，起止坐标都是大端 u16）并进入写显存状态（RAMWR）。
